@@ -8,6 +8,7 @@ from Module.media_download import (
     MediaDownloadTooLarge,
     download_limited,
 )
+from Module.retry_policy import RetryPolicy
 
 
 def make_response(chunks: list[bytes], content_length: int | None = None) -> MagicMock:
@@ -67,3 +68,31 @@ def test_download_limited_classifies_permanent_client_error() -> None:
         )
 
     response.close.assert_called_once()
+
+
+def test_download_limited_retries_transient_server_error() -> None:
+    client = MagicMock()
+    unavailable = make_response([])
+    unavailable.status_code = 503
+    unavailable.raise_for_status.side_effect = requests.HTTPError(
+        "unavailable",
+        response=unavailable,
+    )
+    success = make_response([b"image"], 5)
+    client.get.side_effect = [unavailable, success]
+
+    assert (
+        download_limited(
+            client,
+            "https://example.com/image",
+            headers=None,
+            timeout=1,
+            max_bytes=6,
+            retry_policy=RetryPolicy(base_delay=0),
+        )
+        == b"image"
+    )
+
+    assert client.get.call_count == 2
+    unavailable.close.assert_called_once()
+    success.close.assert_called_once()

@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from bs4 import BeautifulSoup
 
 from Module.arca_crawler import (
@@ -14,6 +16,7 @@ from Module.arca_crawler import (
     _is_allowed_image_url,
     _mask_proxy,
 )
+from Module.retry_policy import RetryPolicy
 
 
 class FakeResponse:
@@ -218,6 +221,26 @@ def test_get_latest_posts_allows_same_title_for_different_post_ids(monkeypatch: 
     c = make_crawler(FakeSession({base_url: rows}))
 
     assert [post["post_id"] for post in c.get_latest_posts(max_posts=10)] == ["0", "1"]
+
+
+def test_get_latest_posts_reports_cloudflare_challenge_without_retry() -> None:
+    response = MagicMock()
+    response.status_code = 503
+    response.headers = {"Content-Type": "text/html"}
+    response.text = (
+        "<html><title>Just a moment...</title>"
+        "<script src='/cdn-cgi/challenge-platform/x'></script></html>"
+    )
+    session = MagicMock()
+    session.get.return_value = response
+    crawler = ArcaliveCrawler(
+        "https://arca.live/b/genshin",
+        session,
+        retry_policy=RetryPolicy(base_delay=0),
+    )
+
+    assert crawler.get_latest_posts() == []
+    session.get.assert_called_once()
 
 
 def test_create_session_has_browser_headers(monkeypatch: object) -> None:

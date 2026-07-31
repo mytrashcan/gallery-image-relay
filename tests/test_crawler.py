@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from Module.crawler import BoundedSet, DCInsideCrawler
+from Module.retry_policy import RetryPolicy
 
 
 def make_post_row(title: object, post_id: object, has_image: object=False, notice: object=False) -> object:
@@ -124,8 +125,26 @@ class TestGetLatestPost:
         import requests
 
         crawler = make_crawler("")
+        crawler.retry_policy = RetryPolicy(base_delay=0)
         crawler.session.get.side_effect = requests.ConnectionError("boom")
         assert crawler.get_latest_post() is None
+
+    def test_retries_transient_page_error(self) -> None:
+        import requests
+
+        crawler = make_crawler(
+            make_list_html(make_safety_rows() + [make_post_row("safe", 20, True)])
+        )
+        success = crawler.session.get.return_value
+        unavailable = MagicMock(status_code=503, headers={}, text="")
+        unavailable.raise_for_status.side_effect = requests.HTTPError(
+            response=unavailable
+        )
+        crawler.session.get.side_effect = [unavailable, success]
+        crawler.retry_policy = RetryPolicy(base_delay=0)
+
+        assert crawler.get_latest_post()["post_id"] == "20"
+        assert crawler.session.get.call_count == 2
 
 
 @pytest.mark.parametrize("has_image", [True, False])

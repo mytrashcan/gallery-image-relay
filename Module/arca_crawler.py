@@ -11,16 +11,29 @@ import re
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup, SoupStrainer
 
 from Module.config import app_config
 from Module.lru_cache import LRUCache
+from Module.retry_policy import (
+    BlockedByChallenge,
+    RetryPolicy,
+    request_with_policy,
+)
 
 logger = logging.getLogger(__name__)
 
 ARCA_BASE = "https://arca.live"
 _VROW_STRAINER = SoupStrainer(attrs={"class": re.compile(r"\bvrow\b")})
 POST_SKIP_COUNT = 10
+
+_PAGE_RETRY_POLICY = RetryPolicy(
+    max_attempts=3,
+    backoff="exponential",
+    base_delay=1.0,
+    max_delay=4.0,
+)
 
 
 def _mask_proxy(url: str) -> str:
@@ -81,17 +94,26 @@ def _create_session():
 class ArcaliveCrawler:
     """아카라이브 게시글 크롤러."""
 
-    def __init__(self, base_url, session=None):
+    def __init__(self, base_url, session=None, *, retry_policy: RetryPolicy | None = None):
         self.base_url = base_url
         self.sent_items = LRUCache()
         self.session = session or _create_session()
+        self.retry_policy = retry_policy or _PAGE_RETRY_POLICY
 
     # ---------- 포스트 목록 파싱 ----------
 
     def get_latest_posts(self, max_posts=5):
         try:
-            res = self.session.get(self.base_url, timeout=15)
-            res.raise_for_status()
+            res = request_with_policy(
+                lambda: self.session.get(self.base_url, timeout=15),
+                self.retry_policy,
+            )
+        except BlockedByChallenge:
+            logger.warning("아카라이브 목록 Cloudflare challenge 감지")
+            return []
+        except requests.RequestException as e:
+            logger.warning("아카라이브 목록 요청 실패: %s", type(e).__name__)
+            return []
         except Exception as e:
             logger.warning(f"아카라이브 목록 요청 실패: {e}")
             return []
@@ -170,8 +192,20 @@ class ArcaliveCrawler:
 
     def extract_all_images(self, post_url: str) -> list[dict]:
         try:
-            res = self.session.get(post_url, timeout=15)
-            res.raise_for_status()
+            res = request_with_policy(
+                lambda: self.session.get(post_url, timeout=15),
+                self.retry_policy,
+            )
+        except BlockedByChallenge:
+            logger.warning("아카라이브 게시글 Cloudflare challenge 감지: %s", post_url)
+            return []
+        except requests.RequestException as e:
+            logger.warning(
+                "아카라이브 게시글 요청 실패 (%s): %s",
+                post_url,
+                type(e).__name__,
+            )
+            return []
         except Exception as e:
             logger.warning(f"아카라이브 게시글 요청 실패 ({post_url}): {e}")
             return []
