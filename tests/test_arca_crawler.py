@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from bs4 import BeautifulSoup
 
 from Module.arca_crawler import (
@@ -14,6 +16,8 @@ from Module.arca_crawler import (
     _is_allowed_image_url,
     _mask_proxy,
 )
+from Module.delivery_archive import DeliveryArchive, post_key
+from Module.retry_policy import RetryPolicy
 
 
 class FakeResponse:
@@ -136,15 +140,35 @@ def _collect(img_html: object) -> object:
 def test_collect_namu_image() -> None:
     images = _collect('<img src="//ac-p1.namu.la/2026/abc123.png">')
     assert len(images) == 1
-    assert images[0]["url"] == "https://ac-p1.namu.la/2026/abc123.png"
-    assert images[0]["filename"] == "abc123.png"
+    assert images[0].primary_url == (
+        "https://ac-o.namu.la/2026/abc123.png?type=orig"
+    )
+    assert images[0].fallback_urls == (
+        "https://ac-p1.namu.la/2026/abc123.png",
+    )
+    assert images[0].filename_hint == "abc123.png"
 
 
 def test_collect_prefers_original_url() -> None:
     images = _collect(
         '<img src="//ac-p1.namu.la/thumb/x.webp" data-originalurl="https://ac-o.namu.la/orig/x.png">'
     )
-    assert images[0]["url"] == "https://ac-o.namu.la/orig/x.png"
+    assert images[0].primary_url == "https://ac-o.namu.la/orig/x.png?type=orig"
+    assert images[0].fallback_urls[0] == "https://ac-o.namu.la/orig/x.png"
+
+
+def test_collect_uses_data_orig_extension_with_original_as_fallback() -> None:
+    images = _collect(
+        '<img src="//ac-p1.namu.la/2026/clip.webp?token=x" data-orig="gif">'
+    )
+
+    assert images[0].primary_url == (
+        "https://ac-o.namu.la/2026/clip.gif?type=orig&token=x"
+    )
+    assert images[0].fallback_urls[:2] == (
+        "https://ac-o.namu.la/2026/clip.webp?type=orig&token=x",
+        "https://ac-p1.namu.la/2026/clip.webp?token=x",
+    )
 
 
 def test_collect_skips_emoticon() -> None:
@@ -183,7 +207,9 @@ def test_extract_all_images_from_article_body() -> None:
     )
     c = make_crawler(FakeSession({post_url: html}))
     images = c.extract_all_images(post_url)
-    assert [i["filename"] for i in images] == ["one.png", "two.jpg"]
+    assert [i.filename_hint for i in images] == ["one.png", "two.jpg"]
+    assert all(i.headers == {"Referer": post_url} for i in images)
+    assert all(i.source_post_id == "500" for i in images)
 
 
 # ---------- 목록 + dedup ----------
@@ -207,6 +233,38 @@ def test_get_latest_posts_dedups_across_calls(monkeypatch: object) -> None:
     assert c.get_latest_posts(max_posts=10) == []
 
 
+def test_archive_dedups_posts_after_restart(monkeypatch: object, tmp_path) -> None:
+    monkeypatch.setattr("Module.arca_crawler.POST_SKIP_COUNT", 0)
+    base_url = "https://arca.live/b/genshin"
+    rows = "".join(
+        f'<a class="vrow column" href="/b/genshin/{i}">'
+        f'<span class="title">글{i}</span><span class="media-icon"></span></a>'
+        for i in range(2)
+    )
+    archive_path = tmp_path / "delivery.sqlite3"
+
+    with DeliveryArchive(archive_path) as archive:
+        first = ArcaliveCrawler(
+            base_url,
+            FakeSession({base_url: rows}),
+            gallery_name="genshin",
+            delivery_archive=archive,
+        )
+        first.mark_sent("0")
+
+    with DeliveryArchive(archive_path) as archive:
+        restarted = ArcaliveCrawler(
+            base_url,
+            FakeSession({base_url: rows}),
+            gallery_name="genshin",
+            delivery_archive=archive,
+        )
+
+        assert [post["post_id"] for post in restarted.get_latest_posts()] == ["1"]
+        assert "0" in restarted.sent_items
+        assert archive.check("arcalive", "genshin", post_key("0")) is True
+
+
 def test_get_latest_posts_allows_same_title_for_different_post_ids(monkeypatch: object) -> None:
     monkeypatch.setattr("Module.arca_crawler.POST_SKIP_COUNT", 0)
     rows = "".join(
@@ -218,6 +276,26 @@ def test_get_latest_posts_allows_same_title_for_different_post_ids(monkeypatch: 
     c = make_crawler(FakeSession({base_url: rows}))
 
     assert [post["post_id"] for post in c.get_latest_posts(max_posts=10)] == ["0", "1"]
+
+
+def test_get_latest_posts_reports_cloudflare_challenge_without_retry() -> None:
+    response = MagicMock()
+    response.status_code = 503
+    response.headers = {"Content-Type": "text/html"}
+    response.text = (
+        "<html><title>Just a moment...</title>"
+        "<script src='/cdn-cgi/challenge-platform/x'></script></html>"
+    )
+    session = MagicMock()
+    session.get.return_value = response
+    crawler = ArcaliveCrawler(
+        "https://arca.live/b/genshin",
+        session,
+        retry_policy=RetryPolicy(base_delay=0),
+    )
+
+    assert crawler.get_latest_posts() == []
+    session.get.assert_called_once()
 
 
 def test_create_session_has_browser_headers(monkeypatch: object) -> None:

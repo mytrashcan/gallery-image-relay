@@ -91,6 +91,29 @@ def test_publish_does_not_retry_permanent_client_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_publish_async_uses_async_sleep_between_attempts(monkeypatch):
+    response = MagicMock()
+    response.json.return_value = {"id": "abc.jpg"}
+    client = GalleryClient(
+        "http://127.0.0.1:8000",
+        "secret",
+        retry_delay_seconds=0.25,
+    )
+    client.session.post = MagicMock(
+        side_effect=[requests.ConnectionError("not ready"), response]
+    )
+    async_sleep = AsyncMock()
+    monkeypatch.setattr("Module.gallery_client.sleep_async", async_sleep)
+    monkeypatch.setattr(
+        "Module.gallery_client.time.sleep",
+        MagicMock(side_effect=AssertionError("time.sleep called from async retry")),
+    )
+
+    assert await client.publish_async(b"image", "sample.jpg") == {"id": "abc.jpg"}
+    async_sleep.assert_awaited_once_with(0.25)
+
+
+@pytest.mark.asyncio
 async def test_sender_wrapper_publishes_only_after_successful_delivery():
     sender = MagicMock()
     sender.send_to_discord = AsyncMock(side_effect=[False, True])

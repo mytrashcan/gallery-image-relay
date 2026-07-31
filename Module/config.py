@@ -12,6 +12,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ARCHIVE_PATH = "var/delivery_archive.sqlite3"
+
 
 @dataclass
 class AppConfig:
@@ -60,6 +62,9 @@ class AppConfig:
     media_download_max_mb: int = 15
     media_max_pixels: int = 24_000_000
 
+    # Successful-delivery deduplication metadata (never image bytes).
+    archive_path: str = DEFAULT_ARCHIVE_PATH
+
     # Dashboard
     dash_host: str = "127.0.0.1"
     dash_base_url: str = ""
@@ -101,6 +106,7 @@ class AppConfig:
             arca_download_concurrency=int(os.getenv("ARCA_DOWNLOAD_CONCURRENCY", "2")),
             media_download_max_mb=int(os.getenv("MEDIA_DOWNLOAD_MAX_MB", "15")),
             media_max_pixels=int(os.getenv("MEDIA_MAX_PIXELS", "24000000")),
+            archive_path=os.getenv("ARCHIVE_PATH") or DEFAULT_ARCHIVE_PATH,
             dash_host=os.getenv("DASH_HOST", "127.0.0.1"),
             dash_base_url=os.getenv("DASH_BASE_URL", "").strip().rstrip("/"),
         )

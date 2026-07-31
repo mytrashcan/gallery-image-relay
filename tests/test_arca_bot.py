@@ -5,12 +5,15 @@ to avoid real network/Discord dependencies.
 """
 
 import asyncio
+import io
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from PIL import Image
 
 from Module.arca_bot import ArcaBot
+from Module.media_candidate import MediaCandidate
 from Module.media_download import MediaDownloadTooLarge
 
 
@@ -57,6 +60,36 @@ async def test_arca_bot_instantiation(bot):
     assert bot.message_sender is not None
 
 
+def test_gallery_process_shares_one_archive_between_dedup_layers() -> None:
+    archive = MagicMock()
+    base_url = "https://arca.live/b/test"
+    with (
+        patch("Module.arca_bot.DeliveryArchive", return_value=archive) as archive_class,
+        patch("Module.arca_bot.ArcaliveCrawler") as crawler_class,
+        patch("Module.arca_bot.ImageHandler") as handler_class,
+        patch("Module.arca_bot.MessageSender"),
+    ):
+        ArcaBot(
+            token="fake-token",
+            base_url=base_url,
+            channel_ids=[],
+            intents=discord.Intents.default(),
+            gallery_name="genshin",
+        )
+
+    archive_class.assert_called_once()
+    crawler_class.assert_called_once_with(
+        base_url,
+        gallery_name="genshin",
+        delivery_archive=archive,
+    )
+    handler_class.assert_called_once_with(
+        source="arcalive",
+        gallery_name="genshin",
+        delivery_archive=archive,
+    )
+
+
 @pytest.mark.asyncio
 async def test_setup_hook_starts_only_one_crawler_task(bot):
     """The reconnect-safe crawler task is created once."""
@@ -90,8 +123,8 @@ async def test_process_post_with_images(mock_dependencies, bot):
     """
     crawler_mock, _, _ = mock_dependencies
     crawler_mock.extract_all_images.return_value = [
-        {"url": "https://img.example.com/1.jpg", "filename": "1.jpg"},
-        {"url": "https://img.example.com/2.jpg", "filename": "2.jpg"},
+        MediaCandidate("https://ac-o.namu.la/1.jpg", filename_hint="1.jpg"),
+        MediaCandidate("https://ac-o.namu.la/2.jpg", filename_hint="2.jpg"),
     ]
     # Mock _download_and_process to return processed items
     bot._download_and_process = AsyncMock(
@@ -141,8 +174,14 @@ async def test_concurrent_download_results_are_deduplicated_within_post(bot):
 
     downloaded, all_resolved = await bot._download_and_process(
         [
-            {"url": "https://img.example.com/1.jpg", "filename": "first.jpg"},
-            {"url": "https://img.example.com/2.jpg", "filename": "duplicate.jpg"},
+            MediaCandidate(
+                "https://ac-o.namu.la/1.jpg",
+                filename_hint="first.jpg",
+            ),
+            MediaCandidate(
+                "https://ac-o.namu.la/2.jpg",
+                filename_hint="duplicate.jpg",
+            ),
         ],
         "https://arca.live/b/test/1",
     )
@@ -192,20 +231,24 @@ async def test_start_crawling_processes_posts(mock_dependencies, bot):
 async def test_download_single_image_success(mock_dependencies, bot):
     """_download_single_image downloads bytes via requests and returns them."""
 
+    output = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(output, format="PNG")
     resp = MagicMock()
-    resp.content = b"fake-image-bytes"
+    resp.content = output.getvalue()
     resp.headers = {"content-length": str(len(resp.content))}
     resp.iter_content.return_value = [resp.content]
     resp.raise_for_status.return_value = None
 
     with patch("Module.arca_bot.requests.get", return_value=resp) as mock_get:
         result = bot._download_single_image(
-            "https://img.example.com/1.jpg", "https://arca.live/b/test/1"
+            MediaCandidate("https://ac-o.namu.la/1.jpg"),
+            "https://arca.live/b/test/1",
         )
 
-    assert result == b"fake-image-bytes"
+    assert result.data == resp.content
+    assert result.filename == "1.png"
     mock_get.assert_called_once_with(
-        "https://img.example.com/1.jpg",
+        "https://ac-o.namu.la/1.jpg",
         headers={"Referer": "https://arca.live/b/test/1"},
         timeout=15,
         stream=True,
@@ -222,7 +265,8 @@ async def test_download_single_image_failure(mock_dependencies, bot):
         side_effect=requests.RequestException("timeout"),
     ):
         result = bot._download_single_image(
-            "https://img.example.com/fail.jpg", "https://arca.live/"
+            MediaCandidate("https://ac-o.namu.la/fail.jpg"),
+            "https://arca.live/",
         )
 
     assert result is None
@@ -235,7 +279,10 @@ async def test_download_attempt_waits_after_failure(bot):
 
     with patch("Module.arca_bot.asyncio.sleep", AsyncMock()) as mock_sleep:
         result = await bot._download_and_process_one(
-            {"url": "https://img.example.com/fail.jpg", "filename": "fail.jpg"},
+            MediaCandidate(
+                "https://ac-o.namu.la/fail.jpg",
+                filename_hint="fail.jpg",
+            ),
             "https://arca.live/b/test/1",
         )
 
@@ -251,7 +298,10 @@ async def test_permanently_rejected_download_is_resolved(bot):
 
     with patch("Module.arca_bot.asyncio.sleep", AsyncMock()):
         result = await bot._download_and_process_one(
-            {"url": "https://img.example.com/large.jpg", "filename": "large.jpg"},
+            MediaCandidate(
+                "https://ac-o.namu.la/large.jpg",
+                filename_hint="large.jpg",
+            ),
             "https://arca.live/b/test/1",
         )
 

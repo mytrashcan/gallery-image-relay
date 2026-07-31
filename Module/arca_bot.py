@@ -10,18 +10,24 @@ Gallery Image Relay의 dcbot.py와 차이점:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import random
+from dataclasses import replace
 
 import discord
 import requests
 
-from Module.arca_crawler import ArcaliveCrawler
+from Module.arca_crawler import ArcaliveCrawler, _is_allowed_image_url
 from Module.config import app_config
+from Module.delivery_archive import DeliveryArchive
 from Module.embeds import make_image_embed
 from Module.image_handler import ImageHandler
-from Module.media_download import MediaDownloadRejected, download_limited
+from Module.media_candidate import MediaCandidate
+from Module.media_download import (
+    MediaDownloadRejected,
+    VerifiedMedia,
+    download_media_candidate,
+)
 from Module.media_pipeline import MediaPipeline
 from Module.message_sender import MessageSender
 
@@ -51,10 +57,23 @@ class ArcaBot(discord.Client):
         self.token = token
         self.base_url = base_url
         self.channel_ids = channel_ids
-        self.web_gallery_name = gallery_name
+        self.web_gallery_name = str(gallery_name or "")
         self.web_gallery_enabled = app_config.web_gallery
-        self.crawler = ArcaliveCrawler(base_url)
-        self.image_handler = ImageHandler()
+        self.delivery_archive = (
+            DeliveryArchive(app_config.archive_path)
+            if self.web_gallery_name
+            else None
+        )
+        self.crawler = ArcaliveCrawler(
+            base_url,
+            gallery_name=self.web_gallery_name,
+            delivery_archive=self.delivery_archive,
+        )
+        self.image_handler = ImageHandler(
+            source="arcalive",
+            gallery_name=self.web_gallery_name,
+            delivery_archive=self.delivery_archive,
+        )
         # Telegram 없이 Discord 전용 MessageSender
         self.message_sender = MessageSender(
             telegram_bot_token=None,
@@ -92,6 +111,8 @@ class ArcaBot(discord.Client):
             self._crawler_task.cancel()
             await asyncio.gather(self._crawler_task, return_exceptions=True)
         await self.media_pipeline.close()
+        if self.delivery_archive is not None:
+            self.delivery_archive.close()
         await super().close()
 
     async def start_crawling(self) -> object:
@@ -145,7 +166,7 @@ class ArcaBot(discord.Client):
         return sent and all_resolved
 
     async def _download_and_process(
-        self, images: list[dict[str, object]], link: str
+        self, images: list[MediaCandidate], link: str
     ) -> tuple[list[dict[str, object]], bool]:
         """이미지 URL 목록을 다운로드→압축→중복제거하여 전송 가능한 버퍼 목록으로 만든다."""
         results = await asyncio.gather(
@@ -171,68 +192,76 @@ class ArcaBot(discord.Client):
         return unique_items
 
     async def _download_and_process_one(
-        self, img_info: dict[str, object], link: str
+        self, candidate: MediaCandidate, link: str
     ) -> tuple[dict[str, object] | None, bool]:
         async with self._download_semaphore:
+            filename = candidate.filename_hint or "arca-image"
             try:
-                buffer_data = await asyncio.to_thread(
-                    self._download_single_image, img_info["url"], link
+                verified = await asyncio.to_thread(
+                    self._download_single_image,
+                    candidate,
+                    link,
                 )
-                if not buffer_data:
+                if verified is None:
                     return None, False
 
-                # 내용 기반 중복 제거 — process_image 성공 후에 체크 (실패 시 영구 스킵 방지)
                 discord_buffer, telegram_buffer, is_gif = await asyncio.to_thread(
-                    self.image_handler.prepare_image,
-                    buffer_data, img_info["filename"],
+                    self.image_handler.process_image,
+                    verified.data,
+                    verified.filename,
                 )
 
-                content_hash = hashlib.sha256(buffer_data).hexdigest()
-                if self.image_handler.has_seen_hash(content_hash):
-                    logger.info(f"[아카라이브] 중복 이미지 스킵: {img_info['filename']}")
+                if self.image_handler.has_seen_hash(verified.content_hash):
+                    logger.info(f"[아카라이브] 중복 이미지 스킵: {verified.filename}")
                     return None, True
 
                 return {
                     "discord_buffer": discord_buffer,
                     "telegram_buffer": telegram_buffer,
-                    "filename": img_info["filename"],
+                    "filename": verified.filename,
                     "is_gif": is_gif,
-                    "original_data": buffer_data,
-                    "content_hash": content_hash,
+                    "original_data": verified.data,
+                    "content_hash": verified.content_hash,
                     "validated": True,
                 }, True
             except MediaDownloadRejected as e:
                 logger.warning(
-                    f"[아카라이브] 영구적으로 거절된 이미지 ({img_info['filename']}): {e}"
+                    f"[아카라이브] 영구적으로 거절된 이미지 ({filename}): {e}"
                 )
                 return None, True
             except ValueError as e:
-                logger.warning(f"[아카라이브] 이미지 처리 실패 ({img_info['filename']}): {e}")
+                logger.warning(f"[아카라이브] 이미지 처리 실패 ({filename}): {e}")
                 return None, True
             except OSError as e:
-                logger.warning(f"[아카라이브] 이미지 처리 재시도 필요 ({img_info['filename']}): {e}")
+                logger.warning(f"[아카라이브] 이미지 처리 재시도 필요 ({filename}): {e}")
                 return None, False
 
             # Hold the semaphore slot briefly after every CDN attempt, including failures.
             finally:
                 await asyncio.sleep(IMAGE_DOWNLOAD_DELAY)
 
-    def _download_single_image(self, img_url: str, referer: str) -> bytes | None:
-        """단일 이미지 URL을 메모리로 다운로드.
+    def _download_single_image(
+        self,
+        candidate: MediaCandidate,
+        referer: str = "",
+    ) -> VerifiedMedia | None:
+        """Download and validate one ordered Arcalive media fallback chain.
 
         namu.la CDN은 Cloudflare 보호가 없으므로 일반 requests 사용.
         """
-        headers = {"Referer": referer}
+        if candidate.headers is None and referer:
+            candidate = replace(candidate, headers={"Referer": referer})
         try:
-            return download_limited(
+            return download_media_candidate(
                 requests,
-                img_url,
-                headers=headers,
+                candidate,
+                is_allowed_url=_is_allowed_image_url,
+                validate=self.image_handler.validate_image_data,
                 timeout=15,
                 max_bytes=app_config.media_download_max_mb * 1024 * 1024,
             )
         except requests.RequestException as e:
-            logger.warning(f"이미지 다운로드 실패 ({img_url}): {e}")
+            logger.warning("이미지 다운로드 실패 (%s): %s", candidate.primary_url, e)
             return None
 
     async def _send_image_batch(self, batch: list[dict[str, object]], title: str,

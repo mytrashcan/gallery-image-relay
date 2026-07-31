@@ -3,8 +3,10 @@ from __future__ import annotations
 import io
 from unittest.mock import MagicMock
 
+import requests
 from PIL import Image
 
+from Module.delivery_archive import DeliveryArchive, image_key
 from Module.image_handler import (
     MAX_HASH_CACHE_SIZE,
     ImageHandler,
@@ -41,6 +43,29 @@ class TestHashCache:
         handler.is_duplicate("abc")
         handler.clear_seen_hashes()
         assert handler.is_duplicate("abc") is False
+
+    def test_archive_prevents_redelivery_after_restart(self, tmp_path) -> None:
+        archive_path = tmp_path / "delivery.sqlite3"
+
+        with DeliveryArchive(archive_path) as archive:
+            first = ImageHandler(
+                source="dcinside",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            assert first.has_seen_hash("abc") is False
+            first.mark_hash_sent("abc")
+
+        with DeliveryArchive(archive_path) as archive:
+            restarted = ImageHandler(
+                source="dcinside",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+
+            assert restarted.has_seen_hash("abc") is True
+            assert "abc" in restarted._seen_hashes
+            assert archive.check("dcinside", "cats", image_key("abc")) is True
 
 
 class TestProcessImage:
@@ -161,6 +186,41 @@ class TestDownloadImages:
 
         assert images[0][2] == "original.png"
         assert handler.session.get.call_args_list[1].args[0].endswith("original.png")
+
+    def test_falls_back_when_original_attribute_download_fails(self) -> None:
+        data = make_png_bytes()
+        html = (
+            '<div class="writing_view_box"><img '
+            'data-original="https://dcimg8.dcinside.co.kr/missing.png" '
+            'src="https://dcimg8.dcinside.co.kr/fallback.jpg"></div>'
+        )
+        handler = ImageHandler()
+        page_response = MagicMock(text=html)
+        missing_response = MagicMock()
+        missing_response.headers = {}
+        missing_response.status_code = 404
+        missing_response.iter_content.return_value = []
+        missing_response.raise_for_status.side_effect = requests.HTTPError(
+            "not found",
+            response=missing_response,
+        )
+        image_response = MagicMock()
+        image_response.headers = {"content-length": str(len(data))}
+        image_response.iter_content.return_value = [data]
+        handler.session = MagicMock()
+        handler.session.get.side_effect = [
+            page_response,
+            missing_response,
+            image_response,
+        ]
+
+        images = handler.download_images(
+            "https://gall.dcinside.com/mgallery/board/view/?id=test&no=1"
+        )
+
+        assert images[0][4] == data
+        assert handler.session.get.call_args_list[1].args[0].endswith("missing.png")
+        assert handler.session.get.call_args_list[2].args[0].endswith("fallback.jpg")
 
     def test_external_attachment_falls_back_to_inline_image(self) -> None:
         html = (

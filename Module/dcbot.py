@@ -8,6 +8,7 @@ import discord
 
 from Module.config import app_config
 from Module.crawler import DCInsideCrawler
+from Module.delivery_archive import DeliveryArchive
 from Module.image_handler import ImageHandler
 from Module.media_pipeline import MediaPipeline
 from Module.message_sender import MessageSender
@@ -25,9 +26,20 @@ class DCBot(discord.Client):
         self.token = token
         self.base_url = base_url
         self.channel_ids = channel_ids
-        self.gallery_name = str(gallery_name)
-        self.crawler = DCInsideCrawler(base_url)
-        self.image_handler = ImageHandler()
+        self.gallery_name = str(gallery_name or "")
+        self.delivery_archive = (
+            DeliveryArchive(app_config.archive_path) if self.gallery_name else None
+        )
+        self.crawler = DCInsideCrawler(
+            base_url,
+            gallery_name=self.gallery_name,
+            delivery_archive=self.delivery_archive,
+        )
+        self.image_handler = ImageHandler(
+            source="dcinside",
+            gallery_name=self.gallery_name,
+            delivery_archive=self.delivery_archive,
+        )
         self.message_sender = MessageSender(telegram_token, telegram_chat_id, image_handler=self.image_handler)
         self.media_pipeline = MediaPipeline(
             self.message_sender,
@@ -57,6 +69,8 @@ class DCBot(discord.Client):
             await asyncio.gather(self._crawler_task, return_exceptions=True)
         await self.media_pipeline.close()
         self._command_leader.close()
+        if self.delivery_archive is not None:
+            self.delivery_archive.close()
         await super().close()
 
     async def start_crawling(self) -> object:

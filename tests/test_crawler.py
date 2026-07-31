@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from Module.crawler import BoundedSet, DCInsideCrawler
+from Module.delivery_archive import DeliveryArchive, post_key
+from Module.retry_policy import RetryPolicy
 
 
 def make_post_row(title: object, post_id: object, has_image: object=False, notice: object=False) -> object:
@@ -106,6 +108,38 @@ class TestGetLatestPost:
         assert first["post_id"] == "20"
         assert second["post_id"] == "21"
 
+    def test_archive_prevents_redelivery_after_restart(self, tmp_path) -> None:
+        archive_path = tmp_path / "delivery.sqlite3"
+        rows = make_safety_rows() + [
+            make_post_row("delivered", 20, has_image=True),
+            make_post_row("next", 21, has_image=True),
+        ]
+        html = make_list_html(rows)
+
+        with DeliveryArchive(archive_path) as archive:
+            first = DCInsideCrawler(
+                "https://gall.dcinside.com/mgallery/board/lists/?id=test",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            first.mark_sent("20")
+
+        with DeliveryArchive(archive_path) as archive:
+            restarted = DCInsideCrawler(
+                "https://gall.dcinside.com/mgallery/board/lists/?id=test",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            response = MagicMock()
+            response.text = html
+            response.raise_for_status = MagicMock()
+            restarted.session = MagicMock()
+            restarted.session.get.return_value = response
+
+            assert restarted.get_latest_post()["post_id"] == "21"
+            assert "20" in restarted.sent_post_ids
+            assert archive.check("dcinside", "cats", post_key("20")) is True
+
     def test_ignores_external_and_non_post_links(self) -> None:
         rows = make_safety_rows() + [
             '<tr class="ub-content"><td class="gall_tit"><a href="https://evil.example/board/view/?no=1">bad</a></td></tr>',
@@ -124,8 +158,26 @@ class TestGetLatestPost:
         import requests
 
         crawler = make_crawler("")
+        crawler.retry_policy = RetryPolicy(base_delay=0)
         crawler.session.get.side_effect = requests.ConnectionError("boom")
         assert crawler.get_latest_post() is None
+
+    def test_retries_transient_page_error(self) -> None:
+        import requests
+
+        crawler = make_crawler(
+            make_list_html(make_safety_rows() + [make_post_row("safe", 20, True)])
+        )
+        success = crawler.session.get.return_value
+        unavailable = MagicMock(status_code=503, headers={}, text="")
+        unavailable.raise_for_status.side_effect = requests.HTTPError(
+            response=unavailable
+        )
+        crawler.session.get.side_effect = [unavailable, success]
+        crawler.retry_policy = RetryPolicy(base_delay=0)
+
+        assert crawler.get_latest_post()["post_id"] == "20"
+        assert crawler.session.get.call_count == 2
 
 
 @pytest.mark.parametrize("has_image", [True, False])
