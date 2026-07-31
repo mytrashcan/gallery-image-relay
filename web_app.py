@@ -14,6 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 
+from honeypot_trap import HoneypotRecorder, install_trap
 from Module.config import app_config
 from Module.lru_cache import LRUCache
 from Module.memory_gallery import ImageTooLarge, InvalidImage, MemoryGalleryStore
@@ -404,4 +405,5 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
             "maintenance": _maintenance_on(),
         })
 
+    install_trap(app, HoneypotRecorder())
     return app
