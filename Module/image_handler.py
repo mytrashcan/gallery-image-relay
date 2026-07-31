@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import logging
 import math
@@ -15,7 +14,13 @@ from PIL import Image
 
 from Module.config import BS_PARSER, DISCORD_MAX_SIZE, HEADERS, REQUEST_TIMEOUT, app_config
 from Module.lru_cache import LRUCache
-from Module.media_download import MediaDownloadRejected, download_limited
+from Module.media_candidate import MediaCandidate
+from Module.media_download import (
+    MediaDownloadRejected,
+    download_media_candidate,
+    ensure_image_extension,
+    image_extension_from_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +231,12 @@ class ImageHandler:
 
     def prepare_image(self, image_data: bytes, filename: str) -> tuple[object, object, bool]:
         """Validate dimensions once, then build Discord and Telegram buffers."""
+        self.validate_image_data(image_data)
+        return self.process_image(image_data, filename)
+
+    @staticmethod
+    def validate_image_data(image_data: bytes) -> None:
+        """Reject malformed or excessively large decoded images."""
         try:
             with Image.open(io.BytesIO(image_data)) as image:
                 width, height = image.size
@@ -234,7 +245,6 @@ class ImageHandler:
                 image.verify()
         except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
             raise ValueError("invalid image data") from exc
-        return self.process_image(image_data, filename)
 
     @staticmethod
     def _is_allowed_dc_image_url(url: str) -> bool:
@@ -257,15 +267,7 @@ class ImageHandler:
     @staticmethod
     def _image_extension_from_data(image_data: bytes) -> str:
         """Determine the correct image extension from magic bytes."""
-        if image_data[:4] == b'\x89PNG':
-            return 'png'
-        if image_data[:2] == b'\xff\xd8':
-            return 'jpg'
-        if image_data[:6] in (b'GIF87a', b'GIF89a'):
-            return 'gif'
-        if image_data[:4] == b'RIFF' and image_data[8:12] == b'WEBP':
-            return 'webp'
-        return 'jpg'
+        return image_extension_from_data(image_data)
 
     @staticmethod
     def _image_filename(element: object, image_url: str) -> str:
@@ -275,15 +277,31 @@ class ImageHandler:
 
     @staticmethod
     def _ensure_image_extension(filename: str, image_data: bytes) -> str:
-        """If the filename doesn't have a recognizable image extension, derive one from data."""
-        if '.' in filename:
-            ext = filename.rsplit('.', 1)[-1].lower()
-            if ext in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'):
-                return filename
-        # No valid image extension — derive from magic bytes
-        correct_ext = ImageHandler._image_extension_from_data(image_data)
-        base = filename.rsplit('.', 1)[0] if '.' in filename else filename
-        return f"{base}.{correct_ext}"
+        """Make the filename extension agree with the downloaded signature."""
+        return ensure_image_extension(filename, image_data)
+
+    def _media_candidate(
+        self,
+        element: object,
+        post_url: str,
+        headers: dict[str, str],
+    ) -> MediaCandidate | None:
+        sources = []
+        for attribute in ("href", "data-original", "src"):
+            source = element.get(attribute)
+            if source:
+                resolved = urljoin(post_url, source)
+                if resolved not in sources:
+                    sources.append(resolved)
+        if not sources:
+            return None
+        return MediaCandidate(
+            primary_url=sources[0],
+            fallback_urls=tuple(sources[1:]),
+            filename_hint=self._image_filename(element, sources[0]),
+            headers=headers,
+            expected_media_type="image",
+        )
 
     def download_images(self, url: object) -> list | None:
         """Download the first eligible image from a post.
@@ -293,8 +311,9 @@ class ImageHandler:
         containing the processed image buffers and metadata on success.
         """
         try:
-            headers = {'Referer': url}
-            res = self.session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            post_url = str(url)
+            headers = {"Referer": post_url}
+            res = self.session.get(post_url, headers=headers, timeout=REQUEST_TIMEOUT)
             res.raise_for_status()
             soup = BeautifulSoup(res.text, BS_PARSER)
 
@@ -303,49 +322,47 @@ class ImageHandler:
                 element
                 for element in attachment_links
                 if self._is_allowed_dc_image_url(
-                    urljoin(str(url), element.get("href", ""))
+                    urljoin(post_url, element.get("href", ""))
                 )
             ]
             if not image_elements:
                 image_elements = soup.select(".writing_view_box img, .write_div img")
             for element in image_elements:
-                source = element.get("href") or element.get("src") or element.get("data-original")
-                if not source:
+                candidate = self._media_candidate(element, post_url, headers)
+                if candidate is None:
                     continue
-                img_url = urljoin(str(url), source)
-                if not self._is_allowed_dc_image_url(img_url):
-                    continue
-                filename = self._image_filename(element, img_url)
-
-                image_data = download_limited(
+                verified = download_media_candidate(
                     self.session,
-                    img_url,
-                    headers=headers,
+                    candidate,
+                    is_allowed_url=self._is_allowed_dc_image_url,
+                    validate=self.validate_image_data,
                     timeout=REQUEST_TIMEOUT,
                     max_bytes=app_config.media_download_max_mb * 1024 * 1024,
                 )
 
-                # 해시로 중복 체크
-                content_hash = hashlib.sha256(image_data).hexdigest()
-                if self.has_seen_hash(content_hash):
-                    logger.info(f"동일한 파일이 존재합니다. PASS: {filename}")
+                if self.has_seen_hash(verified.content_hash):
+                    logger.info(f"동일한 파일이 존재합니다. PASS: {verified.filename}")
                     return []
 
-                # Fix filename for Discord embed — DCInside now sends .php link text
-                filename = self._ensure_image_extension(filename, image_data)
+                discord_buffer, telegram_buffer, is_gif = self.process_image(
+                    verified.data,
+                    verified.filename,
+                )
 
-                # 이미지 처리 (압축 포함)
-                discord_buffer, telegram_buffer, is_gif = self.prepare_image(image_data, filename)
-
-                logger.info(f"[메모리 버퍼] 파일명: {filename}, 원본 크기: {len(image_data)} bytes, GIF: {is_gif}")
+                logger.info(
+                    "[메모리 버퍼] 파일명: %s, 원본 크기: %s bytes, GIF: %s",
+                    verified.filename,
+                    len(verified.data),
+                    is_gif,
+                )
 
                 return [(
                     discord_buffer,
                     telegram_buffer,
-                    filename,
+                    verified.filename,
                     is_gif,
-                    image_data,
-                    content_hash,
+                    verified.data,
+                    verified.content_hash,
                 )]
 
             return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 from unittest.mock import MagicMock
 
+import requests
 from PIL import Image
 
 from Module.image_handler import (
@@ -161,6 +162,41 @@ class TestDownloadImages:
 
         assert images[0][2] == "original.png"
         assert handler.session.get.call_args_list[1].args[0].endswith("original.png")
+
+    def test_falls_back_when_original_attribute_download_fails(self) -> None:
+        data = make_png_bytes()
+        html = (
+            '<div class="writing_view_box"><img '
+            'data-original="https://dcimg8.dcinside.co.kr/missing.png" '
+            'src="https://dcimg8.dcinside.co.kr/fallback.jpg"></div>'
+        )
+        handler = ImageHandler()
+        page_response = MagicMock(text=html)
+        missing_response = MagicMock()
+        missing_response.headers = {}
+        missing_response.status_code = 404
+        missing_response.iter_content.return_value = []
+        missing_response.raise_for_status.side_effect = requests.HTTPError(
+            "not found",
+            response=missing_response,
+        )
+        image_response = MagicMock()
+        image_response.headers = {"content-length": str(len(data))}
+        image_response.iter_content.return_value = [data]
+        handler.session = MagicMock()
+        handler.session.get.side_effect = [
+            page_response,
+            missing_response,
+            image_response,
+        ]
+
+        images = handler.download_images(
+            "https://gall.dcinside.com/mgallery/board/view/?id=test&no=1"
+        )
+
+        assert images[0][4] == data
+        assert handler.session.get.call_args_list[1].args[0].endswith("missing.png")
+        assert handler.session.get.call_args_list[2].args[0].endswith("fallback.jpg")
 
     def test_external_attachment_falls_back_to_inline_image(self) -> None:
         html = (

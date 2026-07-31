@@ -139,15 +139,35 @@ def _collect(img_html: object) -> object:
 def test_collect_namu_image() -> None:
     images = _collect('<img src="//ac-p1.namu.la/2026/abc123.png">')
     assert len(images) == 1
-    assert images[0]["url"] == "https://ac-p1.namu.la/2026/abc123.png"
-    assert images[0]["filename"] == "abc123.png"
+    assert images[0].primary_url == (
+        "https://ac-o.namu.la/2026/abc123.png?type=orig"
+    )
+    assert images[0].fallback_urls == (
+        "https://ac-p1.namu.la/2026/abc123.png",
+    )
+    assert images[0].filename_hint == "abc123.png"
 
 
 def test_collect_prefers_original_url() -> None:
     images = _collect(
         '<img src="//ac-p1.namu.la/thumb/x.webp" data-originalurl="https://ac-o.namu.la/orig/x.png">'
     )
-    assert images[0]["url"] == "https://ac-o.namu.la/orig/x.png"
+    assert images[0].primary_url == "https://ac-o.namu.la/orig/x.png?type=orig"
+    assert images[0].fallback_urls[0] == "https://ac-o.namu.la/orig/x.png"
+
+
+def test_collect_uses_data_orig_extension_with_original_as_fallback() -> None:
+    images = _collect(
+        '<img src="//ac-p1.namu.la/2026/clip.webp?token=x" data-orig="gif">'
+    )
+
+    assert images[0].primary_url == (
+        "https://ac-o.namu.la/2026/clip.gif?type=orig&token=x"
+    )
+    assert images[0].fallback_urls[:2] == (
+        "https://ac-o.namu.la/2026/clip.webp?type=orig&token=x",
+        "https://ac-p1.namu.la/2026/clip.webp?token=x",
+    )
 
 
 def test_collect_skips_emoticon() -> None:
@@ -186,7 +206,9 @@ def test_extract_all_images_from_article_body() -> None:
     )
     c = make_crawler(FakeSession({post_url: html}))
     images = c.extract_all_images(post_url)
-    assert [i["filename"] for i in images] == ["one.png", "two.jpg"]
+    assert [i.filename_hint for i in images] == ["one.png", "two.jpg"]
+    assert all(i.headers == {"Referer": post_url} for i in images)
+    assert all(i.source_post_id == "500" for i in images)
 
 
 # ---------- 목록 + dedup ----------

@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 
 from Module.config import app_config
 from Module.lru_cache import LRUCache
+from Module.media_candidate import MediaCandidate
 from Module.retry_policy import (
     BlockedByChallenge,
     RetryPolicy,
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 ARCA_BASE = "https://arca.live"
 _VROW_STRAINER = SoupStrainer(attrs={"class": re.compile(r"\bvrow\b")})
 POST_SKIP_COUNT = 10
+_ORIGINAL_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "gif", "webp", "bmp"})
 
 _PAGE_RETRY_POLICY = RetryPolicy(
     max_attempts=3,
@@ -72,6 +74,56 @@ def _is_allowed_image_url(url: str) -> bool:
         and not has_custom_port
         and (hostname == "arca.live" or hostname.endswith(".namu.la"))
     )
+
+
+def _original_image_variant(url: str) -> str:
+    """Translate Arcalive's thumbnail CDN URL into its original-file variant."""
+    parts = urlsplit(url)
+    hostname = (parts.hostname or "").lower()
+    netloc = parts.netloc
+    if re.fullmatch(r"ac-p\d*\.namu\.la", hostname):
+        netloc = "ac-o.namu.la"
+    query = parts.query
+    if not re.search(r"(?:^|&)type=orig(?:&|$)", query):
+        query = f"type=orig&{query}" if query else "type=orig"
+    return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+
+
+def _extension_variant(url: str, extension: str) -> str:
+    parts = urlsplit(url)
+    stem, separator, _ = parts.path.rpartition(".")
+    if not separator or "/" in parts.path[len(stem) :]:
+        return url
+    return urlunsplit(
+        (parts.scheme, parts.netloc, f"{stem}.{extension}", parts.query, "")
+    )
+
+
+def _ordered_media_urls(img_tag) -> tuple[str, ...]:
+    """Build gallery-dl-compatible original and fallback URL variants."""
+    sources = (
+        img_tag.get("data-originalurl", ""),
+        img_tag.get("src", ""),
+    )
+    original_extension = str(img_tag.get("data-orig", "")).casefold().lstrip(".")
+    if original_extension not in _ORIGINAL_EXTENSIONS:
+        original_extension = ""
+
+    urls = []
+    for source in sources:
+        if not source:
+            continue
+        resolved = urljoin(ARCA_BASE, source)
+        original = _original_image_variant(resolved)
+        variants = (
+            (_extension_variant(original, original_extension), original)
+            if original_extension
+            else (original,)
+        )
+        for variant in (*variants, resolved):
+            if variant not in urls and _is_allowed_image_url(variant):
+                urls.append(variant)
+    return tuple(urls)
 
 
 def _create_session():
@@ -190,7 +242,7 @@ class ArcaliveCrawler:
 
     # ---------- 개별 게시글 이미지 추출 ----------
 
-    def extract_all_images(self, post_url: str) -> list[dict]:
+    def extract_all_images(self, post_url: str) -> list[MediaCandidate]:
         try:
             res = request_with_policy(
                 lambda: self.session.get(post_url, timeout=15),
@@ -227,22 +279,23 @@ class ArcaliveCrawler:
         logger.info(f"아카라이브 게시글 이미지 {len(images)}개 발견: {post_url}")
         return images
 
-    def _collect_image(self, img_tag, images: list, seen_urls: set, post_url: str = ""):
+    def _collect_image(
+        self,
+        img_tag,
+        images: list[MediaCandidate],
+        seen_urls: set[str],
+        post_url: str = "",
+    ) -> None:
         classes = img_tag.get("class", [])
         if "arca-emoticon" in classes or img_tag.get("data-type") == "emoticon":
             return
 
-        src = img_tag.get("src", "")
-        orig = img_tag.get("data-originalurl", "")
-        source = orig or src
-        if not source:
+        urls = _ordered_media_urls(img_tag)
+        if not urls:
             return
 
-        download_url = urljoin(ARCA_BASE, source)
-        if not _is_allowed_image_url(download_url):
-            return
-
-        parts = urlsplit(download_url)
+        primary_url, *fallback_urls = urls
+        parts = urlsplit(primary_url)
         clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         if clean_url in seen_urls:
             return
@@ -253,8 +306,14 @@ class ArcaliveCrawler:
             pid = self._extract_post_id(post_url) if post_url else ""
             filename = f"arca_{pid}_{len(images)}.jpg"
 
-        images.append({
-            "url": download_url,
-            "original_url": orig or src,
-            "filename": filename,
-        })
+        post_id = self._extract_post_id(post_url) if post_url else None
+        images.append(
+            MediaCandidate(
+                primary_url=primary_url,
+                fallback_urls=tuple(fallback_urls),
+                filename_hint=filename,
+                headers={"Referer": post_url} if post_url else None,
+                source_post_id=post_id,
+                expected_media_type="image",
+            )
+        )
