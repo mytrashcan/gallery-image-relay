@@ -68,12 +68,18 @@ def _is_allowed_image_url(url: str) -> bool:
         has_custom_port = candidate.port is not None
     except ValueError:
         return False
+    # Arca.live는 2026-07-31 이미지 CDN을 *.namu.la에서 ac-o.arca.live(원본)로 이전.
+    # ac.arca.live(썸네일)는 403으로 직접 다운로드 불가라 allowlist 제외.
     return (
         candidate.scheme == "https"
         and not candidate.username
         and not candidate.password
         and not has_custom_port
-        and (hostname == "arca.live" or hostname.endswith(".namu.la"))
+        and (
+            hostname == "arca.live"
+            or hostname.endswith(".namu.la")
+            or hostname == "ac-o.arca.live"
+        )
     )
 
 
