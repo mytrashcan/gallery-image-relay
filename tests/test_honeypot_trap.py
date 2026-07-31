@@ -44,7 +44,7 @@ class HoneypotTrapTests(unittest.TestCase):
         response = self.client.get("/", headers={"User-Agent": "GPTBot/1.2"})
 
         self.assertEqual(response.status_code, 404)
-        self.assertEqual(response.json()["metadata"]["source"], "ai-honeypot")
+        self.assertEqual(response.json(), {"detail": "Not Found"})
         self.assertEqual(self._events()[0]["category"], "ai-crawler")
 
     def test_normal_browser_is_not_trapped_on_chat_completion_path(self) -> None:
@@ -69,7 +69,8 @@ class HoneypotTrapTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("honeypot", response.text)
+        self.assertIn("DATABASE_PASSWORD=", response.text)
+        self.assertNotIn("honeypot", response.text.casefold())
         event = self._events()[0]
         self.assertEqual(event["category"], "credential-hunter")
         self.assertEqual(event["matched_signature"], "/.env")
@@ -84,7 +85,8 @@ class HoneypotTrapTests(unittest.TestCase):
         body = response.json()
         self.assertIsInstance(body["choices"], list)
         self.assertTrue(body["choices"])
-        self.assertEqual(body["metadata"]["source"], "ai-honeypot")
+        self.assertEqual(body["choices"][0]["message"]["content"], "Service is available.")
+        self.assertNotIn("ai-honeypot", response.text)
 
     def test_recorder_writes_required_jsonl_fields(self) -> None:
         self.recorder.record(
@@ -174,9 +176,42 @@ class HoneypotTrapTests(unittest.TestCase):
         self.assertEqual(real_response.status_code, 200)
         self.assertNotIn("ai-honeypot", real_response.text)
         self.assertEqual(decoy_response.status_code, 200)
-        self.assertEqual(decoy_response.json()["metadata"]["source"], "ai-honeypot")
+        self.assertEqual(decoy_response.json()["data"][0]["id"], "nexusflow-70b")
+        self.assertNotIn("ai-honeypot", decoy_response.text)
         self.assertEqual(decoy_response.headers["x-content-type-options"], "nosniff")
         self.assertEqual([event["path"] for event in self._events()], ["/v1/models"])
+
+
+    def test_all_decoy_responses_are_stealth(self) -> None:
+        decoy_requests = [
+            ("GET", "/.env"),
+            ("GET", "/.aws/credentials"),
+            ("GET", "/credentials.json"),
+            ("GET", "/config.json"),
+            ("GET", "/wp-config.php"),
+            ("GET", "/.git/config"),
+            ("POST", "/api/v1/chat/completions"),
+            ("GET", "/api/v1/models"),
+            ("POST", "/graphql"),
+            ("GET", "/openapi.json"),
+            ("GET", "/swagger.json"),
+            ("GET", "/actuator"),
+            ("GET", "/actuator/env"),
+            ("GET", "/wp-admin"),
+            ("GET", "/api"),
+            ("GET", "/v1"),
+        ]
+        forbidden = ("ai-honeypot", "honeypot", "changeme", "fake", "do_not_use")
+        for method, path in decoy_requests:
+            with self.subTest(path=path, method=method):
+                response = self.client.request(
+                    method,
+                    path,
+                    headers={"User-Agent": "python-requests/2.32.3"},
+                )
+                lowered = response.text.casefold()
+                for marker in forbidden:
+                    self.assertNotIn(marker, lowered)
 
 
 if __name__ == "__main__":

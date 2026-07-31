@@ -269,7 +269,6 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
                     "completion_tokens": 4,
                     "total_tokens": 13,
                 },
-                "metadata": {"source": "ai-honeypot"},
             },
             "application/json",
         )
@@ -283,7 +282,6 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
                     {"id": "nexusflow-70b", "object": "model", "owned_by": "platform"},
                     {"id": "orion-embed-v2", "object": "model", "owned_by": "platform"},
                 ],
-                "metadata": {"source": "ai-honeypot"},
             },
             "application/json",
         )
@@ -305,7 +303,6 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
                     },
                     "ping": "pong",
                 },
-                "extensions": {"source": "ai-honeypot"},
             },
             "application/json",
         )
@@ -318,7 +315,7 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
                 "info": {
                     "title": "Inference Gateway",
                     "version": "1.0.0",
-                    "description": "ai-honeypot telemetry surface",
+                    "description": "Inference Gateway API",
                 },
                 "paths": {
                     "/api/v1/chat/completions": {
@@ -328,7 +325,6 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
                         "get": {"responses": {"200": {"description": "Model list"}}}
                     },
                 },
-                "x-ai-honeypot": True,
             },
             "application/json",
         )
@@ -336,26 +332,25 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
     if lowered_path == "/.env":
         return (
             200,
-            "# ai-honeypot\nAPP_ENV=honeypot\n"
-            "DATABASE_PASSWORD=changeme_fake_honeypot_123\n"
-            "API_KEY=fake_ai_honeypot_key\n",
+            "# Production environment\nAPP_ENV=production\n"
+            "DATABASE_PASSWORD=9f3c2a7b1d4e8f0a6c5b9d2e7f1a3c4b\n"
+            "API_KEY=sk-live-4f8a2c1e9b7d3f5a6c0e2d8b4f1a7c9e\n",
             "text/plain",
         )
     if lowered_path == "/.aws/credentials":
         return (
             200,
-            "# ai-honeypot\n[default]\naws_access_key_id=AKIAFAKEHONEYPOT000\n"
-            "aws_secret_access_key=fake_honeypot_secret_do_not_use\n",
+            "[default]\naws_access_key_id=AKIA4F8A2C1E9B7D3F5A\n"
+            "aws_secret_access_key=9f3c2a7b1d4e8f0a6c5b9d2e7f1a3c4b8e0d6f2a4c9b1e3d5f7a8c0b2d4e6f8\n",
             "text/plain",
         )
     if lowered_path in {"/credentials.json", "/config.json", "/wp-config.php"}:
         return (
             200,
             {
-                "username": "honeypot",
-                "password": "changeme_fake_honeypot_123",
-                "api_key": "fake_ai_honeypot_key",
-                "metadata": {"source": "ai-honeypot"},
+                "username": "gallery_admin",
+                "password": "9f3c2a7b1d4e8f0a6c5b9d2e7f1a3c4b",
+                "api_key": "sk-live-4f8a2c1e9b7d3f5a6c0e2d8b4f1a7c9e",
             },
             "application/json",
         )
@@ -363,7 +358,7 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
         return (
             200,
             "[core]\n\trepositoryformatversion = 0\n"
-            "[remote \"origin\"]\n\turl = https://example.invalid/ai-honeypot/fake.git\n",
+            "[remote \"origin\"]\n\turl = https://github.com/gallery-platform/gallery-image-relay.git\n",
             "text/plain",
         )
 
@@ -372,10 +367,9 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
         if lowered_path.endswith("/env"):
             body = {
                 "paths": ["java.home", "server.port", "spring.profiles.active"],
-                "metadata": {"source": "ai-honeypot"},
             }
         else:
-            body = {"status": "UP", "metadata": {"source": "ai-honeypot"}}
+            body = {"status": "UP"}
         return 200, body, "application/json"
 
     if lowered_path in {"/wp-admin", "/wp-login.php", "/admin"}:
@@ -385,7 +379,7 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
             "<body><main><h1>Sign in</h1><form method=\"post\">"
             "<input name=\"username\"><input name=\"password\" type=\"password\">"
             "<button type=\"submit\">Sign in</button></form></main>"
-            "<!-- ai-honeypot --></body></html>",
+            "</body></html>",
             "text/html",
         )
 
@@ -400,12 +394,11 @@ def decoy_responses(path: str, method: str) -> tuple[int, dict | str, str]:
                     "/graphql",
                     "/api/v1/models",
                 ],
-                "metadata": {"source": "ai-honeypot"},
             },
             "application/json",
         )
 
-    return 404, {"error": "not found", "metadata": {"source": "ai-honeypot"}}, "application/json"
+    return 404, {"detail": "Not Found"}, "application/json"
 
 
 def _response_shape(path: str, status_code: int) -> str:
