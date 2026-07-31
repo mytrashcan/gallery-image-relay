@@ -60,6 +60,36 @@ async def test_arca_bot_instantiation(bot):
     assert bot.message_sender is not None
 
 
+def test_gallery_process_shares_one_archive_between_dedup_layers() -> None:
+    archive = MagicMock()
+    base_url = "https://arca.live/b/test"
+    with (
+        patch("Module.arca_bot.DeliveryArchive", return_value=archive) as archive_class,
+        patch("Module.arca_bot.ArcaliveCrawler") as crawler_class,
+        patch("Module.arca_bot.ImageHandler") as handler_class,
+        patch("Module.arca_bot.MessageSender"),
+    ):
+        ArcaBot(
+            token="fake-token",
+            base_url=base_url,
+            channel_ids=[],
+            intents=discord.Intents.default(),
+            gallery_name="genshin",
+        )
+
+    archive_class.assert_called_once()
+    crawler_class.assert_called_once_with(
+        base_url,
+        gallery_name="genshin",
+        delivery_archive=archive,
+    )
+    handler_class.assert_called_once_with(
+        source="arcalive",
+        gallery_name="genshin",
+        delivery_archive=archive,
+    )
+
+
 @pytest.mark.asyncio
 async def test_setup_hook_starts_only_one_crawler_task(bot):
     """The reconnect-safe crawler task is created once."""

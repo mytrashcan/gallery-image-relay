@@ -15,6 +15,7 @@ import requests
 from bs4 import BeautifulSoup, SoupStrainer
 
 from Module.config import app_config
+from Module.delivery_archive import DeliveryArchive, post_key
 from Module.lru_cache import LRUCache
 from Module.media_candidate import MediaCandidate
 from Module.retry_policy import (
@@ -146,11 +147,23 @@ def _create_session():
 class ArcaliveCrawler:
     """아카라이브 게시글 크롤러."""
 
-    def __init__(self, base_url, session=None, *, retry_policy: RetryPolicy | None = None):
+    def __init__(
+        self,
+        base_url,
+        session=None,
+        *,
+        retry_policy: RetryPolicy | None = None,
+        gallery_name: str = "",
+        delivery_archive: DeliveryArchive | None = None,
+    ):
         self.base_url = base_url
         self.sent_items = LRUCache()
         self.session = session or _create_session()
         self.retry_policy = retry_policy or _PAGE_RETRY_POLICY
+        self.gallery_name = gallery_name
+        self.delivery_archive = delivery_archive
+        if delivery_archive is not None and not gallery_name:
+            raise ValueError("gallery_name is required when using a delivery archive")
 
     # ---------- 포스트 목록 파싱 ----------
 
@@ -187,14 +200,34 @@ class ArcaliveCrawler:
         posts = posts[POST_SKIP_COUNT:]
         new_posts = []
         for post in posts:
-            if post["post_id"] not in self.sent_items:
+            if not self._has_sent(post["post_id"]):
                 new_posts.append(post)
 
         return new_posts[:max_posts]
 
     def mark_sent(self, post_id: str) -> None:
         """Acknowledge a post only after delivery succeeds."""
+        if self.delivery_archive is not None:
+            self.delivery_archive.add(
+                "arcalive",
+                self.gallery_name,
+                post_key(post_id),
+            )
         self.sent_items.add(post_id)
+
+    def _has_sent(self, post_id: str) -> bool:
+        if post_id in self.sent_items:
+            return True
+        if self.delivery_archive is None:
+            return False
+        if not self.delivery_archive.check(
+            "arcalive",
+            self.gallery_name,
+            post_key(post_id),
+        ):
+            return False
+        self.sent_items.add(post_id)
+        return True
 
     def _parse_hybrid_row(self, vrow):
         if self._is_notice_row(vrow):

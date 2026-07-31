@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from Module.config import BS_PARSER, DISCORD_MAX_SIZE, HEADERS, REQUEST_TIMEOUT, app_config
+from Module.delivery_archive import DeliveryArchive, image_key
 from Module.lru_cache import LRUCache
 from Module.media_candidate import MediaCandidate
 from Module.media_download import (
@@ -33,10 +34,23 @@ MAX_GIF_FRAMES = 20
 
 
 class ImageHandler:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        source: str = "",
+        gallery_name: str = "",
+        delivery_archive: DeliveryArchive | None = None,
+    ) -> None:
         self._seen_hashes = LRUCache(MAX_HASH_CACHE_SIZE)
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self.source = source
+        self.gallery_name = gallery_name
+        self.delivery_archive = delivery_archive
+        if delivery_archive is not None and (not source or not gallery_name):
+            raise ValueError(
+                "source and gallery_name are required when using a delivery archive"
+            )
 
     def _is_duplicate(self, content_hash: object) -> bool:
         return self._seen_hashes.add_if_absent(content_hash)
@@ -51,10 +65,27 @@ class ImageHandler:
         )
         return self._is_duplicate(content_hash)
 
-    def has_seen_hash(self, content_hash: object) -> bool:
-        return content_hash in self._seen_hashes
+    def has_seen_hash(self, content_hash: str) -> bool:
+        if content_hash in self._seen_hashes:
+            return True
+        if self.delivery_archive is None:
+            return False
+        if not self.delivery_archive.check(
+            self.source,
+            self.gallery_name,
+            image_key(content_hash),
+        ):
+            return False
+        self._seen_hashes.add(content_hash)
+        return True
 
-    def mark_hash_sent(self, content_hash: object) -> None:
+    def mark_hash_sent(self, content_hash: str) -> None:
+        if self.delivery_archive is not None:
+            self.delivery_archive.add(
+                self.source,
+                self.gallery_name,
+                image_key(content_hash),
+            )
         self._seen_hashes.add(content_hash)
 
     def clear_seen_hashes(self) -> object:

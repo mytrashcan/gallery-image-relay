@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from Module.crawler import BoundedSet, DCInsideCrawler
+from Module.delivery_archive import DeliveryArchive, post_key
 from Module.retry_policy import RetryPolicy
 
 
@@ -106,6 +107,38 @@ class TestGetLatestPost:
 
         assert first["post_id"] == "20"
         assert second["post_id"] == "21"
+
+    def test_archive_prevents_redelivery_after_restart(self, tmp_path) -> None:
+        archive_path = tmp_path / "delivery.sqlite3"
+        rows = make_safety_rows() + [
+            make_post_row("delivered", 20, has_image=True),
+            make_post_row("next", 21, has_image=True),
+        ]
+        html = make_list_html(rows)
+
+        with DeliveryArchive(archive_path) as archive:
+            first = DCInsideCrawler(
+                "https://gall.dcinside.com/mgallery/board/lists/?id=test",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            first.mark_sent("20")
+
+        with DeliveryArchive(archive_path) as archive:
+            restarted = DCInsideCrawler(
+                "https://gall.dcinside.com/mgallery/board/lists/?id=test",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            response = MagicMock()
+            response.text = html
+            response.raise_for_status = MagicMock()
+            restarted.session = MagicMock()
+            restarted.session.get.return_value = response
+
+            assert restarted.get_latest_post()["post_id"] == "21"
+            assert "20" in restarted.sent_post_ids
+            assert archive.check("dcinside", "cats", post_key("20")) is True
 
     def test_ignores_external_and_non_post_links(self) -> None:
         rows = make_safety_rows() + [

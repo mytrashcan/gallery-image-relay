@@ -57,6 +57,39 @@ async def test_dcbot_instantiation(bot):
     assert bot.message_sender is not None
 
 
+def test_gallery_process_shares_one_archive_between_dedup_layers() -> None:
+    import discord
+
+    archive = MagicMock()
+    base_url = "https://gall.dcinside.com/mgallery/board/lists/?id=test"
+    with (
+        patch("Module.dcbot.DeliveryArchive", return_value=archive) as archive_class,
+        patch("Module.dcbot.DCInsideCrawler") as crawler_class,
+        patch("Module.dcbot.ImageHandler") as handler_class,
+    ):
+        DCBot(
+            token="fake-token",
+            base_url=base_url,
+            channel_ids=[],
+            telegram_token="fake-telegram-token",
+            telegram_chat_id="fake-chat-id",
+            intents=discord.Intents.default(),
+            gallery_name="cats",
+        )
+
+    archive_class.assert_called_once()
+    crawler_class.assert_called_once_with(
+        base_url,
+        gallery_name="cats",
+        delivery_archive=archive,
+    )
+    handler_class.assert_called_once_with(
+        source="dcinside",
+        gallery_name="cats",
+        delivery_archive=archive,
+    )
+
+
 @pytest.mark.asyncio
 async def test_setup_hook_starts_only_one_crawler_task(bot):
     """The reconnect-safe crawler task is created once."""

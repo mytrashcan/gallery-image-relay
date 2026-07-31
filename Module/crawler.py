@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup, SoupStrainer
 
 from Module.config import BS_PARSER, HEADERS, REQUEST_TIMEOUT
+from Module.delivery_archive import DeliveryArchive, post_key
 
 # BoundedSet 은 공통 LRUCache 로 통합됨 — 기존 import(arca_crawler/테스트) 호환 위해 재노출
 from Module.lru_cache import BoundedSet, LRUCache  # noqa: F401
@@ -41,12 +42,18 @@ class DCInsideCrawler:
         base_url: object,
         *,
         retry_policy: RetryPolicy | None = None,
+        gallery_name: str = "",
+        delivery_archive: DeliveryArchive | None = None,
     ) -> None:
         self.base_url = base_url
         self.sent_post_ids = LRUCache(MAX_CACHE_SIZE)
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.retry_policy = retry_policy or _PAGE_RETRY_POLICY
+        self.gallery_name = gallery_name
+        self.delivery_archive = delivery_archive
+        if delivery_archive is not None and not gallery_name:
+            raise ValueError("gallery_name is required when using a delivery archive")
 
     def image_check(self, element: object) -> object:
         """이미지 포함 여부 체크"""
@@ -91,7 +98,7 @@ class DCInsideCrawler:
 
                     logger.debug(f"{title} {link} {image_insert}")
 
-                    if post_id not in self.sent_post_ids:
+                    if not self._has_sent(post_id):
                         return {
                             'link': link,
                             'title': title,
@@ -117,4 +124,24 @@ class DCInsideCrawler:
 
     def mark_sent(self, post_id: str) -> None:
         """Acknowledge a post only after delivery succeeds."""
+        if self.delivery_archive is not None:
+            self.delivery_archive.add(
+                "dcinside",
+                self.gallery_name,
+                post_key(post_id),
+            )
         self.sent_post_ids.add(post_id)
+
+    def _has_sent(self, post_id: str) -> bool:
+        if post_id in self.sent_post_ids:
+            return True
+        if self.delivery_archive is None:
+            return False
+        if not self.delivery_archive.check(
+            "dcinside",
+            self.gallery_name,
+            post_key(post_id),
+        ):
+            return False
+        self.sent_post_ids.add(post_id)
+        return True

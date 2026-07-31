@@ -19,6 +19,7 @@ import requests
 
 from Module.arca_crawler import ArcaliveCrawler, _is_allowed_image_url
 from Module.config import app_config
+from Module.delivery_archive import DeliveryArchive
 from Module.embeds import make_image_embed
 from Module.image_handler import ImageHandler
 from Module.media_candidate import MediaCandidate
@@ -56,10 +57,23 @@ class ArcaBot(discord.Client):
         self.token = token
         self.base_url = base_url
         self.channel_ids = channel_ids
-        self.web_gallery_name = gallery_name
+        self.web_gallery_name = str(gallery_name or "")
         self.web_gallery_enabled = app_config.web_gallery
-        self.crawler = ArcaliveCrawler(base_url)
-        self.image_handler = ImageHandler()
+        self.delivery_archive = (
+            DeliveryArchive(app_config.archive_path)
+            if self.web_gallery_name
+            else None
+        )
+        self.crawler = ArcaliveCrawler(
+            base_url,
+            gallery_name=self.web_gallery_name,
+            delivery_archive=self.delivery_archive,
+        )
+        self.image_handler = ImageHandler(
+            source="arcalive",
+            gallery_name=self.web_gallery_name,
+            delivery_archive=self.delivery_archive,
+        )
         # Telegram 없이 Discord 전용 MessageSender
         self.message_sender = MessageSender(
             telegram_bot_token=None,
@@ -97,6 +111,8 @@ class ArcaBot(discord.Client):
             self._crawler_task.cancel()
             await asyncio.gather(self._crawler_task, return_exceptions=True)
         await self.media_pipeline.close()
+        if self.delivery_archive is not None:
+            self.delivery_archive.close()
         await super().close()
 
     async def start_crawling(self) -> object:

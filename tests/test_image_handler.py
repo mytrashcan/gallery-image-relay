@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import requests
 from PIL import Image
 
+from Module.delivery_archive import DeliveryArchive, image_key
 from Module.image_handler import (
     MAX_HASH_CACHE_SIZE,
     ImageHandler,
@@ -42,6 +43,29 @@ class TestHashCache:
         handler.is_duplicate("abc")
         handler.clear_seen_hashes()
         assert handler.is_duplicate("abc") is False
+
+    def test_archive_prevents_redelivery_after_restart(self, tmp_path) -> None:
+        archive_path = tmp_path / "delivery.sqlite3"
+
+        with DeliveryArchive(archive_path) as archive:
+            first = ImageHandler(
+                source="dcinside",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            assert first.has_seen_hash("abc") is False
+            first.mark_hash_sent("abc")
+
+        with DeliveryArchive(archive_path) as archive:
+            restarted = ImageHandler(
+                source="dcinside",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+
+            assert restarted.has_seen_hash("abc") is True
+            assert "abc" in restarted._seen_hashes
+            assert archive.check("dcinside", "cats", image_key("abc")) is True
 
 
 class TestProcessImage:

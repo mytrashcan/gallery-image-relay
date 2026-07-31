@@ -6,7 +6,9 @@
 
 **Gallery Image Relay** scrapes images from **DCInside** and **Arcalive** (arca.live), then relays them to **Discord**, **Telegram**, and an optional ephemeral web gallery. It is designed to run on cloud servers such as **Oracle Cloud** and **Amazon Web Services**.
 
-> **No persistent image storage:** gallery images exist only in the web process's volatile **RAM**. They are never saved to disk or a database, expire automatically, and disappear immediately whenever the web process restarts.
+> **No persistent image storage:** gallery images exist only in the web process's volatile **RAM**. Image bytes, titles, and URLs are never saved to disk or a database; they expire automatically and disappear immediately whenever the web process restarts.
+>
+> To prevent successful deliveries from being repeated after a crawler restart, the relay stores only minimal deduplication metadata in SQLite: namespaced post IDs, image SHA256 hashes, and delivery timestamps. The ledger defaults to `var/delivery_archive.sqlite3` and can be moved with `ARCHIVE_PATH`; it never contains image bytes.
 
 Two crawler types are supported:
 

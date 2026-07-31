@@ -16,6 +16,7 @@ from Module.arca_crawler import (
     _is_allowed_image_url,
     _mask_proxy,
 )
+from Module.delivery_archive import DeliveryArchive, post_key
 from Module.retry_policy import RetryPolicy
 
 
@@ -230,6 +231,38 @@ def test_get_latest_posts_dedups_across_calls(monkeypatch: object) -> None:
         c.mark_sent(post["post_id"])
     # 같은 목록을 다시 크롤 → 이미 본 글이라 없음
     assert c.get_latest_posts(max_posts=10) == []
+
+
+def test_archive_dedups_posts_after_restart(monkeypatch: object, tmp_path) -> None:
+    monkeypatch.setattr("Module.arca_crawler.POST_SKIP_COUNT", 0)
+    base_url = "https://arca.live/b/genshin"
+    rows = "".join(
+        f'<a class="vrow column" href="/b/genshin/{i}">'
+        f'<span class="title">글{i}</span><span class="media-icon"></span></a>'
+        for i in range(2)
+    )
+    archive_path = tmp_path / "delivery.sqlite3"
+
+    with DeliveryArchive(archive_path) as archive:
+        first = ArcaliveCrawler(
+            base_url,
+            FakeSession({base_url: rows}),
+            gallery_name="genshin",
+            delivery_archive=archive,
+        )
+        first.mark_sent("0")
+
+    with DeliveryArchive(archive_path) as archive:
+        restarted = ArcaliveCrawler(
+            base_url,
+            FakeSession({base_url: rows}),
+            gallery_name="genshin",
+            delivery_archive=archive,
+        )
+
+        assert [post["post_id"] for post in restarted.get_latest_posts()] == ["1"]
+        assert "0" in restarted.sent_items
+        assert archive.check("arcalive", "genshin", post_key("0")) is True
 
 
 def test_get_latest_posts_allows_same_title_for_different_post_ids(monkeypatch: object) -> None:
