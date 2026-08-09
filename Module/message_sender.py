@@ -8,6 +8,7 @@ from PIL import Image
 from telegram import Bot
 from telegram.request import HTTPXRequest
 
+from Module.delivery_result import ChannelDelivery, DeliveryOutcome
 from Module.embeds import make_image_embed
 
 logger = logging.getLogger(__name__)
@@ -83,55 +84,196 @@ class MessageSender:
         buffer.seek(0)
         return buffer
 
+    @staticmethod
+    def _discord_delivery(
+        destination_id: str,
+        requested_media: tuple[str, ...],
+        delivered_media: tuple[str, ...],
+    ) -> ChannelDelivery:
+        if len(delivered_media) == len(requested_media) and requested_media:
+            outcome = DeliveryOutcome.SUCCEEDED
+        elif delivered_media:
+            outcome = DeliveryOutcome.PARTIAL
+        else:
+            outcome = DeliveryOutcome.FAILED
+        return ChannelDelivery(
+            transport="discord",
+            destination_id=destination_id,
+            outcome=outcome,
+            requested_media=requested_media,
+            delivered_media=delivered_media,
+            ack_eligible=True,
+            reason=None if outcome is DeliveryOutcome.SUCCEEDED else "send_failed",
+        )
+
+    async def _send_discord_file(
+        self,
+        channel: object,
+        image_buffer: object,
+        filename: object,
+        embed: discord.Embed,
+        *,
+        validated: bool = False,
+    ) -> bool:
+        try:
+            if not validated and not await asyncio.to_thread(self.validate_image_buffer, image_buffer):
+                logger.error("Discord 전송 취소: 이미지 검증 실패")
+                return False
+
+            try:
+                await channel.send(
+                    file=discord.File(image_buffer, filename=filename),
+                    embed=embed,
+                )
+            except discord.HTTPException as exc:
+                if exc.status != 413:
+                    raise
+                return await self._send_recompressed_discord_file(
+                    channel,
+                    image_buffer,
+                    filename,
+                    embed,
+                )
+
+            logger.info(f"Discord 전송 성공: {filename}")
+            return True
+        except discord.HTTPException as exc:
+            logger.error(f"Discord HTTP 에러: {exc.status} - {exc.text}")
+            return False
+        except Exception as exc:
+            logger.error(f"Discord 전송 실패: {type(exc).__name__}: {str(exc)}")
+            return False
+        finally:
+            try:
+                image_buffer.seek(0)
+            except (OSError, ValueError):
+                pass
+
+    async def _send_recompressed_discord_file(
+        self,
+        channel: object,
+        image_buffer: object,
+        filename: object,
+        embed: discord.Embed,
+    ) -> bool:
+        if self.image_handler is None:
+            logger.error(f"Discord 재압축 불가: image handler 없음 ({filename})")
+            return False
+
+        try:
+            logger.warning(f"Discord 413 (파일 크기 초과): {filename} — 재압축 후 재시도")
+            recompressed = await asyncio.to_thread(
+                self.recompress_for_discord, channel, image_buffer, filename
+            )
+            if recompressed is None:
+                logger.error(f"Discord 재압축 실패: {filename}")
+                return False
+            await channel.send(
+                file=discord.File(recompressed, filename=filename),
+                embed=embed,
+            )
+            logger.info(f"Discord 재압축 전송 성공: {filename}")
+            return True
+        except discord.HTTPException as exc:
+            logger.error(f"Discord 재압축 HTTP 에러: {exc.status} - {exc.text}")
+            return False
+        except Exception as exc:
+            logger.error(f"Discord 재압축 전송 실패: {type(exc).__name__}: {str(exc)}")
+            return False
+        finally:
+            try:
+                image_buffer.seek(0)
+            except (OSError, ValueError):
+                pass
+
+    async def send_discord_payload(
+        self,
+        channel: object,
+        items: list[dict[str, object]],
+        *,
+        files: list[discord.File],
+        embeds: list[discord.Embed],
+        destination_id: str,
+        requested_media: tuple[str, ...],
+    ) -> ChannelDelivery:
+        """한 Discord 채널에 payload를 전송하고 413이면 항목별로 fallback한다."""
+        if (
+            not items
+            or len(items) != len(files)
+            or len(items) != len(embeds)
+            or len(items) != len(requested_media)
+        ):
+            return self._discord_delivery(destination_id, requested_media, ())
+
+        for item in items:
+            image_buffer = item["discord_buffer"]
+            if not item.get("validated", False) and not await asyncio.to_thread(
+                self.validate_image_buffer, image_buffer
+            ):
+                logger.error("Discord 배치 전송 취소: 이미지 검증 실패")
+                return self._discord_delivery(destination_id, requested_media, ())
+            image_buffer.seek(0)
+
+        try:
+            await channel.send(files=files, embeds=embeds)
+            return self._discord_delivery(destination_id, requested_media, requested_media)
+        except discord.HTTPException as exc:
+            if exc.status != 413:
+                logger.error(f"Discord HTTP 에러: {exc.status} - {exc.text}")
+                return self._discord_delivery(destination_id, requested_media, ())
+            logger.warning("Discord batch 413 — 항목별 전송으로 fallback")
+        except Exception as exc:
+            logger.error(f"Discord 전송 실패: {type(exc).__name__}: {str(exc)}")
+            return self._discord_delivery(destination_id, requested_media, ())
+        finally:
+            for item in items:
+                try:
+                    item["discord_buffer"].seek(0)
+                except (OSError, ValueError):
+                    pass
+
+        delivered_media = []
+        for item, embed, media_id in zip(items, embeds, requested_media, strict=True):
+            if len(items) == 1:
+                sent = await self._send_recompressed_discord_file(
+                    channel,
+                    item["discord_buffer"],
+                    item["filename"],
+                    embed,
+                )
+            else:
+                sent = await self._send_discord_file(
+                    channel,
+                    item["discord_buffer"],
+                    item["filename"],
+                    embed,
+                    validated=True,
+                )
+            if sent:
+                delivered_media.append(media_id)
+            if len(items) > 1:
+                await asyncio.sleep(0.5)
+
+        return self._discord_delivery(
+            destination_id,
+            requested_media,
+            tuple(delivered_media),
+        )
+
     async def send_to_discord(self, channel: object, title: object, image_buffer: object, filename: object, url: object=None, *, validated: bool=False, footer: object=None) -> object:
         """디스코드로 이미지 전송 (413 시 재압축 후 1회 재시도)
 
         url이 주어지면 임베드 제목이 해당 게시글로 가는 하이퍼링크가 된다.
         footer가 주어지면 임베드 하단에 표시된다.
         """
-        try:
-            if not validated and not await asyncio.to_thread(self.validate_image_buffer, image_buffer):
-                logger.error("Discord 전송 취소: 이미지 검증 실패")
-                return False
-
-            embed = make_image_embed(filename, title=title, url=url, color=DISCORD_EMBED_COLOR, footer=footer)
-
-            try:
-                await channel.send(
-                    file=discord.File(image_buffer, filename=filename),
-                    embed=embed
-                )
-            except discord.HTTPException as e:
-                if e.status != 413 or self.image_handler is None:
-                    raise
-                logger.warning(f"Discord 413 (파일 크기 초과): {filename} — 재압축 후 재시도")
-                recompressed = await asyncio.to_thread(
-                    self.recompress_for_discord, channel, image_buffer, filename
-                )
-                if recompressed is None:
-                    logger.error(f"Discord 재압축 실패: {filename}")
-                    return False
-                await channel.send(
-                    file=discord.File(recompressed, filename=filename),
-                    embed=embed
-                )
-
-            logger.info(f"Discord 전송 성공: {filename}")
-            return True
-
-        except discord.HTTPException as e:
-            logger.error(f"Discord HTTP 에러: {e.status} - {e.text}")
-            return False
-        except Exception as e:
-            logger.error(f"Discord 전송 실패: {type(e).__name__}: {str(e)}")
-            return False
-        finally:
-            # 호출부(dcbot)가 같은 버퍼로 여러 채널에 반복 전송하므로,
-            # 성공/실패와 무관하게 항상 읽기 위치를 리셋해 다음 전송에 대비한다.
-            try:
-                image_buffer.seek(0)
-            except (OSError, ValueError):
-                pass
+        embed = make_image_embed(filename, title=title, url=url, color=DISCORD_EMBED_COLOR, footer=footer)
+        return await self._send_discord_file(
+            channel,
+            image_buffer,
+            filename,
+            embed,
+            validated=validated,
+        )
 
     async def send_to_telegram(self, image_buffer: object, filename: object=None, is_gif: object=False, max_retries: object=3, *, validated: bool=False) -> object:
         """텔레그램으로 이미지 전송 (GIF는 animation으로, 재시도 포함)"""

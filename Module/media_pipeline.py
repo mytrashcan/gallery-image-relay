@@ -22,6 +22,7 @@ class MediaPipeline:
         discord_embed_color: int = 0xFF5733,
         telegram_enabled: bool = True,
         source_label: str = "아카라이브",
+        web_publish_requires_discord_success: bool = False,
     ):
         self.message_sender = message_sender
         self.client = client
@@ -32,6 +33,7 @@ class MediaPipeline:
         self.discord_embed_color = discord_embed_color
         self.telegram_enabled = telegram_enabled
         self.source_label = source_label
+        self.web_publish_requires_discord_success = web_publish_requires_discord_success
         self.gallery_client = GalleryClient() if web_gallery_enabled else None
         self._web_queue: asyncio.Queue | None = None
         self._web_worker_task: asyncio.Task | None = None
@@ -58,7 +60,7 @@ class MediaPipeline:
     def _get_channel(self, channel_id, *, warn_missing: bool = False):
         channel = self.client.get_channel(int(channel_id))
         if channel is None and warn_missing:
-            logger.warning(f"[아카라이브] 채널 없음: {channel_id}")
+            logger.warning("[%s] 채널 없음: %s", self.source_label, channel_id)
         return channel
 
     def _gallery_title(self, title: str, global_idx: int) -> str:
@@ -150,27 +152,84 @@ class MediaPipeline:
     def _media_ids(items) -> tuple[str, ...]:
         return tuple(str(item.get("content_hash") or item["filename"]) for item in items)
 
-    async def send_single_to_channels(
+    def _build_discord_payload(
         self,
-        image_item,
+        items,
         *,
-        title=None,
-        link=None,
-        global_index=0,
+        title: str,
+        link: str | None,
+        start_index: int = 0,
+    ) -> tuple[list[discord.File], list[discord.Embed]]:
+        files = []
+        embeds = []
+        for item_index, item in enumerate(items):
+            image_buffer = item["discord_buffer"]
+            image_buffer.seek(0)
+            filename = item["filename"]
+            global_index = start_index + item_index
+            is_first_global_image = global_index == 0
+
+            files.append(discord.File(image_buffer, filename=filename))
+            embeds.append(make_image_embed(
+                filename,
+                title=title if is_first_global_image else None,
+                url=link if is_first_global_image else None,
+                color=self.discord_embed_color,
+                footer=(
+                    f"{self.source_label} · {len(items)}개 이미지"
+                    if is_first_global_image
+                    else None
+                ),
+            ))
+        return files, embeds
+
+    async def _attach_successful_batch_to_web(
+        self,
+        items,
+        *,
+        title: str,
+        link: str | None,
+        start_index: int,
+        include_media: set[str] | None = None,
     ) -> DeliveryResult:
-        """단일 이미지를 모든 Discord 채널로 팬아웃한다."""
-        discord_buffer = image_item["discord_buffer"]
-        filename = image_item["filename"]
-        requested_media = self._media_ids((image_item,))
+        result = DeliveryResult(())
+        requested_media = self._media_ids(items)
+        for item_index, item in enumerate(items):
+            media_id = requested_media[item_index]
+            if include_media is not None and media_id not in include_media:
+                continue
+            web_result = await self.attach_to_web_gallery(
+                self._web_image_data(item),
+                item["filename"],
+                start_index + item_index,
+                title,
+                link or "",
+                media_id=media_id,
+            )
+            result = result.merge(web_result)
+        return result
+
+    async def send_discord_batch(
+        self,
+        items,
+        *,
+        title: str,
+        link: str | None,
+        start_index: int = 0,
+    ) -> DeliveryResult:
+        """한 이미지 batch를 모든 Discord 채널로 fan-out한다."""
+        batch = list(items)
+        requested_media = self._media_ids(batch)
 
         result = DeliveryResult(())
         for channel_id in self.channel_ids:
-            channel = self._get_channel(channel_id)
+            destination_id = str(channel_id)
+            channel = self._get_channel(channel_id, warn_missing=True)
             if not channel:
                 result = result.merge(DeliveryResult((
                     ChannelDelivery(
                         transport="discord",
-                        destination_id=str(channel_id),
+                        destination_id=destination_id,
                         outcome=DeliveryOutcome.FAILED,
                         requested_media=requested_media,
                         delivered_media=(),
@@ -180,26 +239,48 @@ class MediaPipeline:
                 )))
                 continue
 
-            sent = await self.message_sender.send_to_discord(
-                channel,
-                title or "",
-                discord_buffer,
-                filename,
-                link,
-                validated=image_item.get("validated", False),
-                footer=f"{self.source_label} · 1개 이미지",
+            files, embeds = self._build_discord_payload(
+                batch,
+                title=title,
+                link=link,
+                start_index=start_index,
             )
-            result = result.merge(DeliveryResult((
-                ChannelDelivery(
-                    transport="discord",
-                    destination_id=str(channel_id),
-                    outcome=DeliveryOutcome.SUCCEEDED if sent else DeliveryOutcome.FAILED,
-                    requested_media=requested_media,
-                    delivered_media=requested_media if sent else (),
-                    ack_eligible=True,
-                    reason=None if sent else "send_failed",
-                ),
-            )))
+            channel_delivery = await self.message_sender.send_discord_payload(
+                channel,
+                batch,
+                files=files,
+                embeds=embeds,
+                destination_id=destination_id,
+                requested_media=requested_media,
+            )
+            result = result.merge(DeliveryResult((channel_delivery,)))
+
+        if (
+            self.web_gallery_enabled
+            and self.web_publish_requires_discord_success
+            and result.acknowledged
+        ):
+            result = result.merge(await self._attach_successful_batch_to_web(
+                batch,
+                title=title,
+                link=link,
+                start_index=start_index,
+            ))
+        elif self.web_gallery_enabled and self.web_publish_requires_discord_success:
+            delivered_media = {
+                media_id
+                for delivery in result.deliveries
+                if delivery.transport == "discord"
+                for media_id in delivery.delivered_media
+            }
+            if delivered_media:
+                result = result.merge(await self._attach_successful_batch_to_web(
+                    batch,
+                    title=title,
+                    link=link,
+                    start_index=start_index,
+                    include_media=delivered_media,
+                ))
         return result
 
     async def distribute(
@@ -221,11 +302,11 @@ class MediaPipeline:
             is_gif = image_item["is_gif"]
             requested_media = self._media_ids((image_item,))
 
-            discord_result = await self.send_single_to_channels(
-                image_item,
-                title=title if global_index == 0 else "",
-                link=link if global_index == 0 else None,
-                global_index=global_index,
+            discord_result = await self.send_discord_batch(
+                [image_item],
+                title=title,
+                link=link,
+                start_index=global_index,
             )
             result = result.merge(discord_result)
 
@@ -277,92 +358,3 @@ class MediaPipeline:
             await asyncio.gather(self._web_worker_task, return_exceptions=True)
         if self.gallery_client is not None:
             self.gallery_client.close()
-
-    async def send_batch_to_channel(
-        self,
-        channel,
-        batch,
-        *,
-        title,
-        link,
-        batch_index,
-        destination_id: str | None = None,
-    ) -> DeliveryResult:
-        """한 채널에 배치 이미지를 단일 Discord 메시지로 전송한다."""
-        requested_media = self._media_ids(batch)
-        resolved_destination_id = destination_id
-        if resolved_destination_id is None:
-            channel_id = getattr(channel, "id", "") if channel is not None else ""
-            resolved_destination_id = str(channel_id or "")
-
-        if channel is None:
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="discord",
-                    destination_id=resolved_destination_id,
-                    outcome=DeliveryOutcome.FAILED,
-                    requested_media=requested_media,
-                    delivered_media=(),
-                    ack_eligible=True,
-                    reason="channel_not_found",
-                ),
-            ))
-
-        for item in batch:
-            item["discord_buffer"].seek(0)
-
-        files = []
-        embeds = []
-
-        for i, item in enumerate(batch):
-            buffer = item["discord_buffer"]
-            filename = item["filename"]
-            global_idx = batch_index + i
-
-            files.append(discord.File(buffer, filename=filename))
-
-            if global_idx == 0:
-                embed = make_image_embed(
-                    filename,
-                    title=title,
-                    url=link,
-                    color=self.discord_embed_color,
-                    footer=f"{self.source_label} · {len(batch)}개 이미지",
-                )
-            else:
-                embed = make_image_embed(filename, color=self.discord_embed_color)
-            embeds.append(embed)
-
-        try:
-            await channel.send(files=files, embeds=embeds)
-            logger.info(
-                f"[아카라이브] 배치 전송 완료: {title} "
-                f"({batch_index + 1}~{batch_index + len(batch)}/{len(batch)})"
-            )
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="discord",
-                    destination_id=resolved_destination_id,
-                    outcome=DeliveryOutcome.SUCCEEDED,
-                    requested_media=requested_media,
-                    delivered_media=requested_media,
-                    ack_eligible=True,
-                ),
-            ))
-        except discord.HTTPException as e:
-            logger.error(f"[아카라이브] Discord 전송 실패: {e.status} {e.text}")
-            if e.status == 413 and hasattr(self.client, "_send_fallback"):
-                return await self.client._send_fallback(
-                    channel, batch, title, link, batch_index
-                )
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="discord",
-                    destination_id=resolved_destination_id,
-                    outcome=DeliveryOutcome.FAILED,
-                    requested_media=requested_media,
-                    delivered_media=(),
-                    ack_eligible=True,
-                    reason="send_failed",
-                ),
-            ))
