@@ -48,6 +48,7 @@ class DCBot(discord.Client):
             image_handler=self.image_handler,
             web_gallery_enabled=app_config.web_gallery,
             web_gallery_name=self.gallery_name,
+            source_label="디시인사이드",
         )
         self._crawler_task: asyncio.Task | None = None
         self._command_leader = ProcessLeaderLock()

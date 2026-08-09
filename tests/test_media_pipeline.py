@@ -1,10 +1,64 @@
 import asyncio
 import io
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from Module.media_pipeline import MediaPipeline
+
+
+@pytest.mark.asyncio
+async def test_send_single_forwards_source_footer() -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [12345], source_label="디시인사이드")
+    pipeline.message_sender.send_to_discord = AsyncMock(return_value=True)
+
+    sent = await pipeline.send_single_to_channels(
+        {"discord_buffer": io.BytesIO(b"x"), "filename": "a.jpg", "validated": True},
+        title="제목",
+        link="https://gall.dcinside.com/1",
+    )
+
+    assert sent is True
+    pipeline.message_sender.send_to_discord.assert_awaited_once()
+    call = pipeline.message_sender.send_to_discord.await_args
+    assert call is not None
+    assert call.kwargs["footer"] == "디시인사이드 · 1개 이미지"
+
+
+@pytest.mark.asyncio
+async def test_batch_footer_uses_source_label() -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [12345])
+    channel = MagicMock()
+    channel.send = AsyncMock()
+
+    batch = [
+        {"discord_buffer": io.BytesIO(b"a"), "filename": "a.jpg"},
+        {"discord_buffer": io.BytesIO(b"b"), "filename": "b.jpg"},
+    ]
+    ok = await pipeline.send_batch_to_channel(
+        channel, batch, title="제목", link="https://arca.live/1", batch_index=0
+    )
+
+    assert ok is True
+    sent = channel.send.await_args
+    embeds = sent.kwargs["embeds"]
+    assert embeds[0].footer.text == "아카라이브 · 2개 이미지"
+    assert embeds[1].footer.text is None
+
+
+@pytest.mark.asyncio
+async def test_batch_footer_custom_label() -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [12345], source_label="디시인사이드")
+    channel = MagicMock()
+    channel.send = AsyncMock()
+
+    batch = [{"discord_buffer": io.BytesIO(b"a"), "filename": "a.jpg"}]
+    await pipeline.send_batch_to_channel(
+        channel, batch, title="제목", link="https://gall.dcinside.com/1", batch_index=0
+    )
+
+    sent = channel.send.await_args
+    assert sent.kwargs["embeds"][0].footer.text == "디시인사이드 · 1개 이미지"
 
 
 @pytest.mark.asyncio
