@@ -83,17 +83,18 @@ class MessageSender:
         buffer.seek(0)
         return buffer
 
-    async def send_to_discord(self, channel: object, title: object, image_buffer: object, filename: object, url: object=None, *, validated: bool=False) -> object:
+    async def send_to_discord(self, channel: object, title: object, image_buffer: object, filename: object, url: object=None, *, validated: bool=False, footer: object=None) -> object:
         """디스코드로 이미지 전송 (413 시 재압축 후 1회 재시도)
 
         url이 주어지면 임베드 제목이 해당 게시글로 가는 하이퍼링크가 된다.
+        footer가 주어지면 임베드 하단에 표시된다.
         """
         try:
             if not validated and not await asyncio.to_thread(self.validate_image_buffer, image_buffer):
                 logger.error("Discord 전송 취소: 이미지 검증 실패")
                 return False
 
-            embed = make_image_embed(filename, title=title, url=url, color=DISCORD_EMBED_COLOR)
+            embed = make_image_embed(filename, title=title, url=url, color=DISCORD_EMBED_COLOR, footer=footer)
 
             try:
                 await channel.send(

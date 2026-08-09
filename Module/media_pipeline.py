@@ -20,6 +20,7 @@ class MediaPipeline:
         web_gallery_name: str = "",
         discord_embed_color: int = 0xFF5733,
         telegram_enabled: bool = True,
+        source_label: str = "아카라이브",
     ):
         self.message_sender = message_sender
         self.client = client
@@ -29,6 +30,7 @@ class MediaPipeline:
         self.web_gallery_name = web_gallery_name
         self.discord_embed_color = discord_embed_color
         self.telegram_enabled = telegram_enabled
+        self.source_label = source_label
         self.gallery_client = GalleryClient() if web_gallery_enabled else None
         self._web_queue: asyncio.Queue | None = None
         self._web_worker_task: asyncio.Task | None = None
@@ -107,6 +109,7 @@ class MediaPipeline:
                     filename,
                     link,
                     validated=image_item.get("validated", False),
+                    footer=f"{self.source_label} · 1개 이미지",
                 ) or sent
         return sent
 
@@ -198,7 +201,7 @@ class MediaPipeline:
                     title=title,
                     url=link,
                     color=self.discord_embed_color,
-                    footer=f"아카라이브 · {len(batch)}개 이미지",
+                    footer=f"{self.source_label} · {len(batch)}개 이미지",
                 )
             else:
                 embed = make_image_embed(filename, color=self.discord_embed_color)
