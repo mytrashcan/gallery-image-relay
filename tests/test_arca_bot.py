@@ -159,6 +159,18 @@ async def test_process_post_no_images(mock_dependencies, bot):
 
 
 @pytest.mark.asyncio
+async def test_process_post_retries_when_post_detail_fetch_fails(mock_dependencies, bot):
+    crawler_mock, _, _ = mock_dependencies
+    crawler_mock.extract_all_images.return_value = None
+
+    post = {"title": "Unavailable", "link": "https://arca.live/b/test/3"}
+    result = await bot.process_post(post)
+
+    crawler_mock.extract_all_images.assert_called_once_with(post["link"])
+    assert result is False
+
+
+@pytest.mark.asyncio
 async def test_concurrent_download_results_are_deduplicated_within_post(bot):
     first = {
         "discord_buffer": MagicMock(),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -280,6 +281,65 @@ def test_security_headers_present(monkeypatch, tmp_path):
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
     assert "max-age=" in response.headers["strict-transport-security"]
+
+
+def test_verify_rejects_oversized_body_before_turnstile_call(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "turnstile_secret", "test-secret")
+    siteverify = MagicMock(return_value=True)
+    monkeypatch.setattr(web_app, "_ts_siteverify", siteverify)
+
+    response = client.post("/verify", json={"token": "x" * web_app._VERIFY_MAX_BYTES})
+
+    assert response.status_code == 413
+    siteverify.assert_not_called()
+
+
+def test_verify_rejects_oversized_stream_without_content_length(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "turnstile_secret", "test-secret")
+    siteverify = MagicMock(return_value=True)
+    monkeypatch.setattr(web_app, "_ts_siteverify", siteverify)
+    data = b"x" * (web_app._VERIFY_MAX_BYTES + 1)
+
+    response = client.post(
+        "/verify",
+        content=iter((data[:100], data[100:])),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    siteverify.assert_not_called()
+
+
+def test_verify_rejects_non_string_token_without_turnstile_call(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "turnstile_secret", "test-secret")
+    siteverify = MagicMock(return_value=True)
+    monkeypatch.setattr(web_app, "_ts_siteverify", siteverify)
+
+    response = client.post("/verify", json={"token": ["unexpected"]})
+
+    assert response.status_code == 403
+    siteverify.assert_not_called()
+
+
+def test_verify_accepts_valid_string_token(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "turnstile_secret", "test-secret")
+    siteverify = MagicMock(return_value=True)
+    monkeypatch.setattr(web_app, "_ts_siteverify", siteverify)
+
+    response = client.post(
+        "/verify",
+        json={"token": "turnstile-token"},
+        headers={"cf-connecting-ip": "203.0.113.8"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert "ts_ok=" in response.headers["set-cookie"]
+    siteverify.assert_called_once_with("turnstile-token", "203.0.113.8")
 
 
 def test_static_pages_do_not_include_ad_network_hooks():

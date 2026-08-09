@@ -136,6 +136,9 @@ class ArcaBot(discord.Client):
     async def process_post(self, post: object) -> object:
         """게시글 내 모든 이미지를 추출하여 디스코드로 전송한다."""
         images = await asyncio.to_thread(self.crawler.extract_all_images, post["link"])
+        if images is None:
+            logger.warning(f"[아카라이브] 게시글 조회 실패, 다음 폴링에서 재시도: {post['title']}")
+            return False
         if not images:
             logger.info(f"[아카라이브] 이미지 없음: {post['title']}")
             return True

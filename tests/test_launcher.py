@@ -1,4 +1,5 @@
 import io
+from collections import deque
 from contextlib import nullcontext
 from unittest.mock import MagicMock
 
@@ -55,6 +56,22 @@ def test_platform_limits_are_independent_and_capped_at_five():
     assert 1 <= launcher.MAX_ARCA <= 5
 
 
+def test_pick_from_queue_schedules_spawn_failure_for_retry(monkeypatch):
+    launcher.processes.clear()
+    launcher.restart_failures.clear()
+    monkeypatch.setattr("launcher.is_already_running", lambda gallery_name: False)
+    monkeypatch.setattr("launcher.time.monotonic", lambda: 50.0)
+    monkeypatch.setattr("launcher.run_script", MagicMock(side_effect=OSError("fork failed")))
+
+    selected = launcher._pick_from_queue(deque(["dc"]), 1, "DC")
+
+    assert selected == 1
+    assert launcher.processes["dc"] == (None, 52.0, 1)
+    assert launcher.restart_failures["dc"] == 1
+    launcher.processes.clear()
+    launcher.restart_failures.clear()
+
+
 def test_monitor_batch_restarts_only_crashed_process(monkeypatch):
     healthy = MagicMock()
     healthy.poll.return_value = None
@@ -77,6 +94,22 @@ def test_monitor_batch_restarts_only_crashed_process(monkeypatch):
     launcher.monitor_batch({"dc-a", "dc-b"})
     assert launcher.processes["dc-b"][0] is restarted
     launcher.processes.clear()
+
+
+def test_monitor_batch_reschedules_when_restart_spawn_fails(monkeypatch):
+    launcher.processes.clear()
+    launcher.restart_failures.clear()
+    launcher.processes["dc"] = (None, 99.0, 1)
+    launcher.restart_failures["dc"] = 1
+    monkeypatch.setattr("launcher.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("launcher.run_script", MagicMock(side_effect=OSError("fork failed")))
+
+    launcher.monitor_batch({"dc"})
+
+    assert launcher.processes["dc"] == (None, 104.0, 2)
+    assert launcher.restart_failures["dc"] == 2
+    launcher.processes.clear()
+    launcher.restart_failures.clear()
 
 
 def test_stopping_dc_batch_does_not_stop_arca(monkeypatch):

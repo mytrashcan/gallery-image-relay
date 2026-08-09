@@ -264,8 +264,8 @@ Notes for small instances (1 GB RAM free tier):
 ├── run_web_gallery.py     # Single gallery runner + embedded web gallery (FastAPI)
 ├── run_web_server.py      # Standalone web gallery server (for the multi-gallery launcher setup)
 ├── dashboard.py           # Live terminal monitor (web feed + crawler processes)
-├── web_app.py             # FastAPI app & filesystem-backed ephemeral feed (TTL/prune)
-├── web_static/            # Gallery page (index.html) + temporary images/ (gitignored)
+├── web_app.py             # FastAPI app & bounded RAM-only ephemeral feed (TTL/eviction)
+├── web_static/            # Gallery page and versioned static assets
 ├── galleries.json         # Gallery configuration (URLs, channel IDs)
 ├── requirements.txt       # Runtime dependencies
 ├── requirements-dev.txt   # Dev dependencies (pytest, ruff)

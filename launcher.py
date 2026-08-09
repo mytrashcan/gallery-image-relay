@@ -178,27 +178,54 @@ def stop_running_processes(timeout: float = 10.0) -> object:
     """Terminate the whole batch concurrently within one shared deadline."""
     stop_processes(set(processes), timeout)
 
+
+def _restart_delay(failures: int) -> float:
+    return min(RESTART_BACKOFF_MAX, 2 ** min(failures, 6))
+
+
 def _pick_from_queue(queue: object, max_count: object, source_label: object) -> object:
     """큐에서 최대 max_count개의 갤러리를 선택 (실행 중이면 건너뜀)"""
-    started = 0
+    selected = 0
+    launched = 0
+    scheduled = 0
     skipped = 0
     for _ in range(len(queue)):
-        if started >= max_count:
+        if selected >= max_count:
             break
         if not queue:
             break
         gallery_name = queue.popleft()
         if not is_already_running(gallery_name):
-            process = run_script(gallery_name)
-            processes[gallery_name] = (process, time.time())
-            started += 1
+            try:
+                process = run_script(gallery_name)
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures = restart_failures.get(gallery_name, 0) + 1
+                restart_failures[gallery_name] = failures
+                delay = _restart_delay(failures)
+                processes[gallery_name] = (None, time.monotonic() + delay, failures)
+                scheduled += 1
+                logger.error(
+                    "%s 크롤러 시작 실패(%s). %.1f초 후 다시 시도합니다.",
+                    gallery_name,
+                    exc,
+                    delay,
+                )
+            else:
+                processes[gallery_name] = (process, time.time())
+                launched += 1
+            selected += 1
         else:
             skipped += 1
         queue.append(gallery_name)
 
-    if started > 0:
-        logger.info(f"{source_label}: {started}개 시작됨" + (f", {skipped}개 이미 실행 중" if skipped else ""))
-    return started
+    if selected > 0:
+        summary = [f"{launched}개 시작됨"]
+        if scheduled:
+            summary.append(f"{scheduled}개 재시작 대기")
+        if skipped:
+            summary.append(f"{skipped}개 이미 실행 중")
+        logger.info("%s: %s", source_label, ", ".join(summary))
+    return selected
 
 
 def monitor_batch(expected_galleries: set[str]) -> None:
@@ -214,7 +241,7 @@ def monitor_batch(expected_galleries: set[str]) -> None:
             continue
         failures = restart_failures.get(gallery_name, 0) + 1
         restart_failures[gallery_name] = failures
-        delay = min(RESTART_BACKOFF_MAX, 2 ** min(failures, 6))
+        delay = _restart_delay(failures)
         logger.warning(
             "%s 크롤러 종료(code=%s, uptime=%.1fs). %.1f초 후 재시작합니다.",
             gallery_name,
@@ -231,7 +258,20 @@ def monitor_batch(expected_galleries: set[str]) -> None:
         _, restart_at, failures = entry
         if now < restart_at:
             continue
-        process = run_script(gallery_name)
+        try:
+            process = run_script(gallery_name)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures += 1
+            restart_failures[gallery_name] = failures
+            delay = _restart_delay(failures)
+            processes[gallery_name] = (None, now + delay, failures)
+            logger.error(
+                "%s 크롤러 재시작 실패(%s). %.1f초 후 다시 시도합니다.",
+                gallery_name,
+                exc,
+                delay,
+            )
+            continue
         processes[gallery_name] = (process, time.time())
 
 def manage_crawlers() -> object:
