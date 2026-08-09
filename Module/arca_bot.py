@@ -20,6 +20,7 @@ import requests
 from Module.arca_crawler import ArcaliveCrawler, _is_allowed_image_url
 from Module.config import app_config
 from Module.delivery_archive import DeliveryArchive
+from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
 from Module.embeds import make_image_embed
 from Module.image_handler import ImageHandler
 from Module.media_candidate import MediaCandidate
@@ -158,15 +159,15 @@ class ArcaBot(discord.Client):
             return all_resolved
 
         # 배치 처리: MAX_EMBEDS_PER_MSG개씩 나눠서 전송
-        sent = False
+        delivery_result = DeliveryResult(())
         for batch_start in range(0, len(downloaded), MAX_EMBEDS_PER_MSG):
             batch = downloaded[batch_start : batch_start + MAX_EMBEDS_PER_MSG]
-            batch_sent = await self._send_image_batch(batch, title, link, batch_start)
-            if batch_sent:
+            batch_result = await self._send_image_batch(batch, title, link, batch_start)
+            if batch_result.acknowledged:
                 for item in batch:
                     self.image_handler.mark_hash_sent(item["content_hash"])
-            sent = batch_sent or sent
-        return sent and all_resolved
+            delivery_result = delivery_result.merge(batch_result)
+        return delivery_result.acknowledged and all_resolved
 
     async def _download_and_process(
         self, images: list[MediaCandidate], link: str
@@ -267,8 +268,13 @@ class ArcaBot(discord.Client):
             logger.warning("이미지 다운로드 실패 (%s): %s", candidate.primary_url, e)
             return None
 
-    async def _send_image_batch(self, batch: list[dict[str, object]], title: str,
-                                link: str, batch_index: int) -> bool:
+    async def _send_image_batch(
+        self,
+        batch: list[dict[str, object]],
+        title: str,
+        link: str,
+        batch_index: int,
+    ) -> DeliveryResult:
         """한 배치의 이미지를 Discord embed로 전송한다.
 
         - 첫 번째 embed: title + link 포함
@@ -282,51 +288,68 @@ class ArcaBot(discord.Client):
                 for item in batch
             ]
 
-        sent_ok = False
+        requested_media = self.media_pipeline._media_ids(batch)
+        delivery_result = DeliveryResult(())
         for channel_id in self.channel_ids:
             channel = self.get_channel(int(channel_id))
             if not channel:
                 logger.warning(f"[아카라이브] 채널 없음: {channel_id}")
+                delivery_result = delivery_result.merge(DeliveryResult((
+                    ChannelDelivery(
+                        transport="discord",
+                        destination_id=str(channel_id),
+                        outcome=DeliveryOutcome.FAILED,
+                        requested_media=requested_media,
+                        delivered_media=(),
+                        ack_eligible=True,
+                        reason="channel_not_found",
+                    ),
+                )))
                 continue
 
-            batch_sent = await self.media_pipeline.send_batch_to_channel(
+            batch_result = await self.media_pipeline.send_batch_to_channel(
                 channel,
                 batch,
                 title=title,
                 link=link,
                 batch_index=batch_index,
+                destination_id=str(channel_id),
             )
-            sent_ok = sent_ok or batch_sent
+            delivery_result = delivery_result.merge(batch_result)
 
         # 전송 성공한 배치를 공유 웹 갤러리에 적재
         # (fallback 경로는 _send_fallback 내부에서 개별 적재)
-        if sent_ok and gallery_snapshot:
+        if delivery_result.acknowledged and gallery_snapshot:
             for i, (data, filename) in enumerate(gallery_snapshot):
-                await self.media_pipeline.attach_to_web_gallery(
+                web_result = await self.media_pipeline.attach_to_web_gallery(
                     data,
                     filename,
                     batch_index + i,
                     title,
                     link,
                 )
+                delivery_result = delivery_result.merge(web_result)
 
         # 배치 간 딜레이 (rate limit 방지)
         if batch_index > 0:
             await asyncio.sleep(INTER_IMAGE_DELAY)
-        return sent_ok
+        return delivery_result
 
     async def _save_to_web_gallery(self, data: bytes, filename: str,
-                                   global_idx: int, title: str, link: str) -> object:
+                                   global_idx: int, title: str, link: str) -> DeliveryResult:
         """WEB_GALLERY=1 이면 전송된 이미지를 공유 웹 갤러리에 적재한다.
 
         첫 번째 이미지에는 원본 제목, 이후 이미지에는 '제목 - N' 형식으로 표시한다.
         """
-        await self.media_pipeline.attach_to_web_gallery(data, filename, global_idx, title, link)
+        return await self.media_pipeline.attach_to_web_gallery(data, filename, global_idx, title, link)
 
     async def _send_fallback(self, channel: object, batch: list[dict[str, object]], title: str,
-                              link: str, batch_index: int) -> bool:
+                              link: str, batch_index: int) -> DeliveryResult:
         """413(파일 크기 초과) 발생 시 한 장씩 개별 전송 (재압축 포함)."""
         all_sent = True
+        requested_media = self.media_pipeline._media_ids(batch)
+        delivered_media = []
+        web_result = DeliveryResult(())
         for i, item in enumerate(batch):
             global_idx = batch_index + i
             item["discord_buffer"].seek(0)
@@ -347,7 +370,9 @@ class ArcaBot(discord.Client):
                     embed=embed,
                 )
                 self.image_handler.mark_hash_sent(item["content_hash"])
-                await self._save_to_web_gallery(data, filename, global_idx, title, link)
+                delivered_media.append(requested_media[i])
+                gallery_result = await self._save_to_web_gallery(data, filename, global_idx, title, link)
+                web_result = web_result.merge(gallery_result)
             except discord.HTTPException as e2:
                 if e2.status == 413:
                     # 재압축 시도
@@ -365,9 +390,11 @@ class ArcaBot(discord.Client):
                                 embed=embed,
                             )
                             self.image_handler.mark_hash_sent(item["content_hash"])
-                            await self._save_to_web_gallery(
+                            delivered_media.append(requested_media[i])
+                            gallery_result = await self._save_to_web_gallery(
                                 data, filename, global_idx, title, link
                             )
+                            web_result = web_result.merge(gallery_result)
                         except discord.HTTPException as retry_error:
                             all_sent = False
                             logger.error("아카라이브 fallback 재시도 실패: %s", retry_error)
@@ -378,7 +405,27 @@ class ArcaBot(discord.Client):
                     all_sent = False
 
             await asyncio.sleep(0.5)
-        return all_sent
+
+        if all_sent:
+            outcome = DeliveryOutcome.SUCCEEDED
+        elif delivered_media:
+            outcome = DeliveryOutcome.PARTIAL
+        else:
+            outcome = DeliveryOutcome.FAILED
+
+        channel_id = getattr(channel, "id", "")
+        discord_result = DeliveryResult((
+            ChannelDelivery(
+                transport="discord",
+                destination_id=str(channel_id or ""),
+                outcome=outcome,
+                requested_media=requested_media,
+                delivered_media=tuple(delivered_media),
+                ack_eligible=True,
+                reason=None if all_sent else "send_failed",
+            ),
+        ))
+        return discord_result.merge(web_result)
 
     async def run_bot(self) -> object:
         async with self:
