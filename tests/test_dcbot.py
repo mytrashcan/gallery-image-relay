@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from Module.dcbot import DCBot
+from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
 
 
 @pytest.fixture
@@ -225,7 +226,51 @@ async def test_failed_distribution_does_not_acknowledge_image_hash(mock_dependen
     image_handler_mock.download_images.return_value = [
         (MagicMock(), MagicMock(), "img.png", False, b"original", "hash"),
     ]
-    bot.media_pipeline.distribute = AsyncMock(return_value=False)
+    bot.media_pipeline.distribute = AsyncMock(return_value=DeliveryResult((
+        ChannelDelivery(
+            transport="discord",
+            destination_id="123456789",
+            outcome=DeliveryOutcome.FAILED,
+            requested_media=("hash",),
+            delivered_media=(),
+            ack_eligible=True,
+            reason="send_failed",
+        ),
+    )))
 
     assert await bot.process_post({"title": "x", "link": "https://example.com"}) is False
+    image_handler_mock.mark_hash_sent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_telegram_success_acknowledges_when_discord_fails(mock_dependencies, bot):
+    _, image_handler_mock = mock_dependencies
+    image_handler_mock.download_images.return_value = [
+        (MagicMock(), MagicMock(), "img.png", False, b"original", "hash"),
+    ]
+    bot.message_sender.send_to_discord.return_value = False
+    bot.message_sender.send_to_telegram.return_value = True
+
+    acknowledged = await bot.process_post({"title": "x", "link": "https://example.com"})
+
+    assert acknowledged is True
+    bot.message_sender.send_to_discord.assert_awaited_once()
+    bot.message_sender.send_to_telegram.assert_awaited_once()
+    image_handler_mock.mark_hash_sent.assert_called_once_with("hash")
+
+
+@pytest.mark.asyncio
+async def test_all_destination_failures_do_not_acknowledge_hash(mock_dependencies, bot):
+    _, image_handler_mock = mock_dependencies
+    image_handler_mock.download_images.return_value = [
+        (MagicMock(), MagicMock(), "img.png", False, b"original", "hash"),
+    ]
+    bot.message_sender.send_to_discord.return_value = False
+    bot.message_sender.send_to_telegram.return_value = False
+
+    acknowledged = await bot.process_post({"title": "x", "link": "https://example.com"})
+
+    assert acknowledged is False
+    bot.message_sender.send_to_discord.assert_awaited_once()
+    bot.message_sender.send_to_telegram.assert_awaited_once()
     image_handler_mock.mark_hash_sent.assert_not_called()

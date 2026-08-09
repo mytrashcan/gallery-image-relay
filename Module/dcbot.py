@@ -110,16 +110,16 @@ class DCBot(discord.Client):
             for discord_buffer, telegram_buffer, filename, is_gif, original_data, content_hash in images
         ]
 
-        delivered = await self.media_pipeline.distribute(
+        delivery_result = await self.media_pipeline.distribute(
             media_items,
             title=post['title'],
             link=post['link'],
             inter_image_delay=1.0,
         )
-        if delivered:
+        if delivery_result.acknowledged:
             for item in media_items:
                 self.image_handler.mark_hash_sent(item["content_hash"])
-        return delivered
+        return delivery_result.acknowledged
 
     async def on_message(self, message: object) -> object:
         if message.author == self.user:
