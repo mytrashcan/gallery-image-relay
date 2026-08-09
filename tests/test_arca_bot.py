@@ -59,6 +59,9 @@ async def test_arca_bot_instantiation(bot):
     assert bot.crawler is not None
     assert bot.image_handler is not None
     assert bot.message_sender is not None
+    assert bot.media_pipeline.telegram_enabled is False
+    assert bot.media_pipeline.source_label == "아카라이브"
+    assert bot.media_pipeline.web_publish_requires_discord_success is True
 
 
 def test_gallery_process_shares_one_archive_between_dedup_layers() -> None:
@@ -379,7 +382,7 @@ async def test_unresolved_media_prevents_post_ack_after_successful_delivery(mock
 @pytest.mark.asyncio
 async def test_missing_arca_channel_records_reason_without_send(bot):
     bot.get_channel.return_value = None
-    bot.media_pipeline.send_batch_to_channel = AsyncMock()
+    bot.message_sender.send_discord_payload = AsyncMock()
     batch = [{
         "discord_buffer": io.BytesIO(b"image"),
         "filename": "1.jpg",
@@ -400,17 +403,58 @@ async def test_missing_arca_channel_records_reason_without_send(bot):
         ),
     )
     assert result.acknowledged is False
-    bot.media_pipeline.send_batch_to_channel.assert_not_awaited()
+    bot.message_sender.send_discord_payload.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_fallback_partial_result_preserves_delivered_media(bot):
-    response = MagicMock(status=500, reason="send failed")
-    failure = discord.HTTPException(response, "send failed")
-    channel = MagicMock()
-    channel.id = 123456789
-    channel.send = AsyncMock(side_effect=[None, failure])
-    batch = [
+async def test_arca_batch_delegates_to_shared_fanout_and_preserves_delay(bot):
+    batch = [{
+        "discord_buffer": io.BytesIO(b"first"),
+        "filename": "1.jpg",
+        "content_hash": "h1",
+    }]
+    delivery_result = DeliveryResult((
+        ChannelDelivery(
+            transport="discord",
+            destination_id="123456789",
+            outcome=DeliveryOutcome.SUCCEEDED,
+            requested_media=("h1",),
+            delivered_media=("h1",),
+            ack_eligible=True,
+        ),
+    ))
+    bot.media_pipeline.send_discord_batch = AsyncMock(return_value=delivery_result)
+
+    with patch("Module.arca_bot.asyncio.sleep", AsyncMock()) as sleep:
+        result = await bot._send_image_batch(
+            batch,
+            "title",
+            "https://arca.live/b/test/15",
+            10,
+        )
+
+    assert result is delivery_result
+    bot.media_pipeline.send_discord_batch.assert_awaited_once_with(
+        batch,
+        title="title",
+        link="https://arca.live/b/test/15",
+        start_index=10,
+    )
+    sleep.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_only_media_from_successful_arca_batch_are_hash_marked(
+    mock_dependencies,
+    bot,
+    monkeypatch,
+):
+    crawler_mock, image_handler_mock, _ = mock_dependencies
+    crawler_mock.extract_all_images.return_value = [
+        MediaCandidate("https://ac-o.namu.la/1.jpg", filename_hint="1.jpg"),
+        MediaCandidate("https://ac-o.namu.la/2.jpg", filename_hint="2.jpg"),
+    ]
+    downloaded = [
         {
             "discord_buffer": io.BytesIO(b"first"),
             "filename": "1.jpg",
@@ -421,16 +465,57 @@ async def test_fallback_partial_result_preserves_delivered_media(bot):
             "filename": "2.jpg",
             "content_hash": "h2",
         },
+        {
+            "discord_buffer": io.BytesIO(b"third"),
+            "filename": "3.jpg",
+            "content_hash": "h3",
+        },
     ]
+    bot._download_and_process = AsyncMock(return_value=(downloaded, True))
+    successful_batch = DeliveryResult((
+        ChannelDelivery(
+            transport="discord",
+            destination_id="123456789",
+            outcome=DeliveryOutcome.SUCCEEDED,
+            requested_media=("h1",),
+            delivered_media=("h1",),
+            ack_eligible=True,
+        ),
+    ))
+    partial_batch = DeliveryResult((
+        ChannelDelivery(
+            transport="discord",
+            destination_id="123456789",
+            outcome=DeliveryOutcome.PARTIAL,
+            requested_media=("h2",),
+            delivered_media=("h2",),
+            ack_eligible=True,
+            reason="send_failed",
+        ),
+    ))
+    failed_batch = DeliveryResult((
+        ChannelDelivery(
+            transport="discord",
+            destination_id="123456789",
+            outcome=DeliveryOutcome.FAILED,
+            requested_media=("h3",),
+            delivered_media=(),
+            ack_eligible=True,
+            reason="send_failed",
+        ),
+    ))
+    bot._send_image_batch = AsyncMock(side_effect=[successful_batch, partial_batch, failed_batch])
+    monkeypatch.setattr("Module.arca_bot.MAX_EMBEDS_PER_MSG", 1)
 
-    with patch("Module.arca_bot.asyncio.sleep", AsyncMock()):
-        result = await bot._send_fallback(channel, batch, "title", "https://arca.live/b/test/15", 0)
+    acknowledged = await bot.process_post({
+        "title": "title",
+        "link": "https://arca.live/b/test/16",
+    })
 
-    discord_delivery = result.deliveries[0]
-    assert discord_delivery.outcome is DeliveryOutcome.PARTIAL
-    assert discord_delivery.requested_media == ("h1", "h2")
-    assert discord_delivery.delivered_media == ("h1",)
-    assert discord_delivery.reason == "send_failed"
-    assert result.acknowledged is False
-    assert channel.send.await_count == 2
-    bot.image_handler.mark_hash_sent.assert_called_once_with("h1")
+    assert acknowledged is True
+    assert bot._send_image_batch.await_count == 3
+    # 성공 확정된 media(h1: 전체 성공, h2: PARTIAL fallback에서 전달됨)만 hash 표시.
+    # h3는 FAILED로 전달되지 않았으므로 표시하지 않는다.
+    bot.image_handler.mark_hash_sent.assert_any_call("h1")
+    bot.image_handler.mark_hash_sent.assert_any_call("h2")
+    assert bot.image_handler.mark_hash_sent.call_count == 2

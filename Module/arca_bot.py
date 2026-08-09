@@ -20,8 +20,7 @@ import requests
 from Module.arca_crawler import ArcaliveCrawler, _is_allowed_image_url
 from Module.config import app_config
 from Module.delivery_archive import DeliveryArchive
-from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
-from Module.embeds import make_image_embed
+from Module.delivery_result import DeliveryResult
 from Module.image_handler import ImageHandler
 from Module.media_candidate import MediaCandidate
 from Module.media_download import (
@@ -90,6 +89,8 @@ class ArcaBot(discord.Client):
             web_gallery_name=self.web_gallery_name,
             discord_embed_color=ARCA_EMBED_COLOR,
             telegram_enabled=False,
+            source_label="아카라이브",
+            web_publish_requires_discord_success=True,
         )
         self._crawler_task: asyncio.Task | None = None
         self._download_semaphore = asyncio.Semaphore(
@@ -163,8 +164,15 @@ class ArcaBot(discord.Client):
         for batch_start in range(0, len(downloaded), MAX_EMBEDS_PER_MSG):
             batch = downloaded[batch_start : batch_start + MAX_EMBEDS_PER_MSG]
             batch_result = await self._send_image_batch(batch, title, link, batch_start)
-            if batch_result.acknowledged:
-                for item in batch:
+            delivered_media = {
+                media_id
+                for delivery in batch_result.deliveries
+                if delivery.transport == "discord"
+                for media_id in delivery.delivered_media
+            }
+            # 성공 확정된 media만 hash 표시 (PARTIAL fallback 시 실패 항목은 재시도 대상 유지)
+            for item in batch:
+                if item["content_hash"] in delivered_media:
                     self.image_handler.mark_hash_sent(item["content_hash"])
             delivery_result = delivery_result.merge(batch_result)
         return delivery_result.acknowledged and all_resolved
@@ -275,157 +283,18 @@ class ArcaBot(discord.Client):
         link: str,
         batch_index: int,
     ) -> DeliveryResult:
-        """한 배치의 이미지를 Discord embed로 전송한다.
-
-        - 첫 번째 embed: title + link 포함
-        - 나머지 embed: 이미지만 (제목 없는 깔끔한 갤러리 형태)
-        """
-        # 웹 갤러리 적재용 스냅샷 — 전송 과정에서 버퍼 위치가 소비되므로 미리 확보
-        gallery_snapshot = None
-        if self.web_gallery_enabled:
-            gallery_snapshot = [
-                (self.media_pipeline._web_image_data(item), item["filename"])
-                for item in batch
-            ]
-
-        requested_media = self.media_pipeline._media_ids(batch)
-        delivery_result = DeliveryResult(())
-        for channel_id in self.channel_ids:
-            channel = self.get_channel(int(channel_id))
-            if not channel:
-                logger.warning(f"[아카라이브] 채널 없음: {channel_id}")
-                delivery_result = delivery_result.merge(DeliveryResult((
-                    ChannelDelivery(
-                        transport="discord",
-                        destination_id=str(channel_id),
-                        outcome=DeliveryOutcome.FAILED,
-                        requested_media=requested_media,
-                        delivered_media=(),
-                        ack_eligible=True,
-                        reason="channel_not_found",
-                    ),
-                )))
-                continue
-
-            batch_result = await self.media_pipeline.send_batch_to_channel(
-                channel,
-                batch,
-                title=title,
-                link=link,
-                batch_index=batch_index,
-                destination_id=str(channel_id),
-            )
-            delivery_result = delivery_result.merge(batch_result)
-
-        # 전송 성공한 배치를 공유 웹 갤러리에 적재
-        # (fallback 경로는 _send_fallback 내부에서 개별 적재)
-        if delivery_result.acknowledged and gallery_snapshot:
-            for i, (data, filename) in enumerate(gallery_snapshot):
-                web_result = await self.media_pipeline.attach_to_web_gallery(
-                    data,
-                    filename,
-                    batch_index + i,
-                    title,
-                    link,
-                )
-                delivery_result = delivery_result.merge(web_result)
+        """한 배치를 공통 Discord fan-out 경로로 전송한다."""
+        delivery_result = await self.media_pipeline.send_discord_batch(
+            batch,
+            title=title,
+            link=link,
+            start_index=batch_index,
+        )
 
         # 배치 간 딜레이 (rate limit 방지)
         if batch_index > 0:
             await asyncio.sleep(INTER_IMAGE_DELAY)
         return delivery_result
-
-    async def _save_to_web_gallery(self, data: bytes, filename: str,
-                                   global_idx: int, title: str, link: str) -> DeliveryResult:
-        """WEB_GALLERY=1 이면 전송된 이미지를 공유 웹 갤러리에 적재한다.
-
-        첫 번째 이미지에는 원본 제목, 이후 이미지에는 '제목 - N' 형식으로 표시한다.
-        """
-        return await self.media_pipeline.attach_to_web_gallery(data, filename, global_idx, title, link)
-
-    async def _send_fallback(self, channel: object, batch: list[dict[str, object]], title: str,
-                              link: str, batch_index: int) -> DeliveryResult:
-        """413(파일 크기 초과) 발생 시 한 장씩 개별 전송 (재압축 포함)."""
-        all_sent = True
-        requested_media = self.media_pipeline._media_ids(batch)
-        delivered_media = []
-        web_result = DeliveryResult(())
-        for i, item in enumerate(batch):
-            global_idx = batch_index + i
-            item["discord_buffer"].seek(0)
-            buffer = item["discord_buffer"]
-            filename = item["filename"]
-
-            try:
-                embed_title = title if global_idx == 0 else None
-                embed_link = link if global_idx == 0 else None
-                embed = make_image_embed(
-                    filename, title=embed_title, url=embed_link, color=ARCA_EMBED_COLOR,
-                )
-
-                # 전송 전에 스냅샷 확보 (send가 버퍼 위치를 소비함)
-                data = buffer.getvalue()
-                await channel.send(
-                    file=discord.File(buffer, filename=filename),
-                    embed=embed,
-                )
-                self.image_handler.mark_hash_sent(item["content_hash"])
-                delivered_media.append(requested_media[i])
-                gallery_result = await self._save_to_web_gallery(data, filename, global_idx, title, link)
-                web_result = web_result.merge(gallery_result)
-            except discord.HTTPException as e2:
-                if e2.status == 413:
-                    # 재압축 시도
-                    logger.warning(f"[아카라이브] 413 재압축 시도: {filename}")
-                    recompressed = await asyncio.to_thread(
-                        self.message_sender.recompress_for_discord,
-                        channel, buffer, filename,
-                    )
-                    if recompressed:
-                        embed = make_image_embed(filename, color=ARCA_EMBED_COLOR)
-                        data = recompressed.getvalue()
-                        try:
-                            await channel.send(
-                                file=discord.File(recompressed, filename=filename),
-                                embed=embed,
-                            )
-                            self.image_handler.mark_hash_sent(item["content_hash"])
-                            delivered_media.append(requested_media[i])
-                            gallery_result = await self._save_to_web_gallery(
-                                data, filename, global_idx, title, link
-                            )
-                            web_result = web_result.merge(gallery_result)
-                        except discord.HTTPException as retry_error:
-                            all_sent = False
-                            logger.error("아카라이브 fallback 재시도 실패: %s", retry_error)
-                    else:
-                        all_sent = False
-                else:
-                    logger.error(f"[아카라이브] fallback 전송 실패: {e2}")
-                    all_sent = False
-
-            await asyncio.sleep(0.5)
-
-        if all_sent:
-            outcome = DeliveryOutcome.SUCCEEDED
-        elif delivered_media:
-            outcome = DeliveryOutcome.PARTIAL
-        else:
-            outcome = DeliveryOutcome.FAILED
-
-        channel_id = getattr(channel, "id", "")
-        discord_result = DeliveryResult((
-            ChannelDelivery(
-                transport="discord",
-                destination_id=str(channel_id or ""),
-                outcome=outcome,
-                requested_media=requested_media,
-                delivered_media=tuple(delivered_media),
-                ack_eligible=True,
-                reason=None if all_sent else "send_failed",
-            ),
-        ))
-        return discord_result.merge(web_result)
 
     async def run_bot(self) -> object:
         async with self:
