@@ -97,6 +97,7 @@ def _rate_limited(bucket: dict, ip: str, window: float, max_count: int) -> bool:
 # 시크릿이 설정돼 있을 때만 활성화. 사이트키는 공개값(HTML에 주입), 시크릿은 .env에만 둔다.
 _TS_COOKIE = "ts_ok"
 _TS_TTL = 86400  # 한 번 통과하면 24시간 유지
+_VERIFY_MAX_BYTES = 16 * 1024
 
 
 def _ts_sitekey() -> str:
@@ -109,6 +110,24 @@ def _ts_secret() -> str:
 
 def _ts_enabled() -> bool:
     return bool(_ts_secret())
+
+
+async def _read_verify_body(request: Request) -> bytes | None:
+    """Read a small Turnstile payload without allowing unbounded buffering."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > _VERIFY_MAX_BYTES:
+                return None
+        except ValueError:
+            pass
+
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > _VERIFY_MAX_BYTES:
+            return None
+        data.extend(chunk)
+    return bytes(data)
 
 
 def _ts_make_cookie() -> str:
@@ -357,11 +376,16 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
     async def verify(request: Request) -> object:
         if not _ts_enabled():
             return JSONResponse({"ok": True})
+        raw_body = await _read_verify_body(request)
+        if raw_body is None:
+            return JSONResponse({"error": "payload too large"}, status_code=413)
         try:
-            body = await request.json()
-        except Exception:
+            body = json.loads(raw_body)
+        except (ValueError, UnicodeError, RecursionError):
             body = {}
-        token = body.get("token", "") if isinstance(body, dict) else ""
+        token = body.get("token") if isinstance(body, dict) else None
+        if not isinstance(token, str) or not token:
+            return JSONResponse({"ok": False}, status_code=403)
         ip = request.headers.get("cf-connecting-ip", "")
         ok = await asyncio.to_thread(_ts_siteverify, token, ip)
         if not ok:

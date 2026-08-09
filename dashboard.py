@@ -132,11 +132,12 @@ def _services_panel(health: object, services: object) -> object:
         limit_mb = health.get("memory_limit_bytes", 0) / 1024 / 1024
         memory = f"{used_mb:.1f} / {limit_mb:.0f} MB"
         latest_age = health.get("latest_age_seconds")
-        freshness = (
-            Text("정상", style="green")
-            if health.get("fresh", True)
-            else Text(f"지연 ({latest_age:.0f}s)", style="bold yellow")
-        )
+        if health.get("fresh", True):
+            freshness = Text("정상", style="green")
+        elif latest_age is None:
+            freshness = Text("지연 (수집 없음)", style="bold yellow")
+        else:
+            freshness = Text(f"지연 ({latest_age:.0f}s)", style="bold yellow")
     else:
         web = Text("● DOWN", style="bold red")
         items, ttl, memory, freshness = "-", "-", "-", Text("-", style="dim")

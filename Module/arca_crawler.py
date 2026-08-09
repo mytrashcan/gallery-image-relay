@@ -281,7 +281,8 @@ class ArcaliveCrawler:
 
     # ---------- 개별 게시글 이미지 추출 ----------
 
-    def extract_all_images(self, post_url: str) -> list[MediaCandidate]:
+    def extract_all_images(self, post_url: str) -> list[MediaCandidate] | None:
+        """Return extracted media, or ``None`` when the detail page was unavailable."""
         try:
             res = request_with_policy(
                 lambda: self.session.get(post_url, timeout=15),
@@ -289,17 +290,17 @@ class ArcaliveCrawler:
             )
         except BlockedByChallenge:
             logger.warning("아카라이브 게시글 Cloudflare challenge 감지: %s", post_url)
-            return []
+            return None
         except requests.RequestException as e:
             logger.warning(
                 "아카라이브 게시글 요청 실패 (%s): %s",
                 post_url,
                 type(e).__name__,
             )
-            return []
+            return None
         except Exception as e:
             logger.warning(f"아카라이브 게시글 요청 실패 ({post_url}): {e}")
-            return []
+            return None
 
         soup = BeautifulSoup(res.text, "lxml")
         images = []

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import requests
 from bs4 import BeautifulSoup
 
 from Module.arca_crawler import (
@@ -229,6 +230,18 @@ def test_extract_all_images_from_article_body() -> None:
     assert [i.filename_hint for i in images] == ["one.png", "two.jpg"]
     assert all(i.headers == {"Referer": post_url} for i in images)
     assert all(i.source_post_id == "500" for i in images)
+
+
+def test_extract_all_images_returns_failure_when_detail_request_fails() -> None:
+    session = MagicMock()
+    session.get.side_effect = requests.ConnectionError("temporary outage")
+    crawler = ArcaliveCrawler(
+        "https://arca.live/b/genshin",
+        session=session,
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+
+    assert crawler.extract_all_images("https://arca.live/b/genshin/500") is None
 
 
 # ---------- 목록 + dedup ----------
