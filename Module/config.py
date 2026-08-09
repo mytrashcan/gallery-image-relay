@@ -181,7 +181,7 @@ HEADERS = {
 }
 
 # 디스코드 인텐트 설정
-def get_discord_intents():
+def get_discord_intents() -> discord.Intents:
     intents = discord.Intents.default()
     intents.message_content = True
     return intents

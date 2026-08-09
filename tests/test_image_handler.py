@@ -27,22 +27,23 @@ def make_gif_bytes(frames: object=3, size: object=(64, 64)) -> object:
 
 
 class TestHashCache:
-    def test_first_time_returns_false_then_true(self) -> None:
+    def test_hash_is_unseen_until_marked_sent(self) -> None:
         handler = ImageHandler()
-        assert handler.is_duplicate("abc") is False
-        assert handler.is_duplicate("abc") is True
+        assert handler.has_seen_hash("abc") is False
+        handler.mark_hash_sent("abc")
+        assert handler.has_seen_hash("abc") is True
 
-    def test_cache_is_bounded(self) -> None:
+    def test_sent_hash_cache_is_bounded(self) -> None:
         handler = ImageHandler()
         for i in range(MAX_HASH_CACHE_SIZE + 10):
-            handler.is_duplicate(str(i))
+            handler.mark_hash_sent(str(i))
         assert len(handler._seen_hashes) <= MAX_HASH_CACHE_SIZE
 
-    def test_clear(self) -> None:
+    def test_clear_removes_in_memory_sent_hashes(self) -> None:
         handler = ImageHandler()
-        handler.is_duplicate("abc")
+        handler.mark_hash_sent("abc")
         handler.clear_seen_hashes()
-        assert handler.is_duplicate("abc") is False
+        assert handler.has_seen_hash("abc") is False
 
     def test_archive_prevents_redelivery_after_restart(self, tmp_path) -> None:
         archive_path = tmp_path / "delivery.sqlite3"

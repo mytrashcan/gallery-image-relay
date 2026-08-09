@@ -8,6 +8,7 @@ from PIL import Image
 
 from Module.delivery_result import DeliveryOutcome, DeliveryResult
 from Module.image_handler import ImageHandler
+from Module.media_pipeline import PreparedMedia
 from Module.message_sender import MessageSender
 
 
@@ -59,12 +60,24 @@ def make_sender(with_handler=True):
     return MessageSender("123456:TEST-TOKEN", "0", image_handler=handler)
 
 
+def prepared_media(buffer: io.BytesIO, filename: str, *, validated: bool = True) -> PreparedMedia:
+    return PreparedMedia(
+        discord_buffer=buffer,
+        telegram_buffer=io.BytesIO(buffer.getvalue()),
+        filename=filename,
+        content_hash=filename,
+        is_gif=False,
+        original_data=b"",
+        validated=validated,
+    )
+
+
 def make_batch_payload():
     items = [
-        {"discord_buffer": io.BytesIO(b"first"), "filename": "first.jpg", "validated": True},
-        {"discord_buffer": io.BytesIO(b"second"), "filename": "second.jpg", "validated": True},
+        prepared_media(io.BytesIO(b"first"), "first.jpg"),
+        prepared_media(io.BytesIO(b"second"), "second.jpg"),
     ]
-    files = [discord.File(item["discord_buffer"], filename=item["filename"]) for item in items]
+    files = [discord.File(item.discord_buffer, filename=item.filename) for item in items]
     embeds = [discord.Embed(), discord.Embed()]
     return items, files, embeds
 
@@ -114,11 +127,7 @@ class TestDiscord413Fallback:
         channel = SingleBatch413Channel()
         buffer = make_large_png_buffer()
         original_size = len(buffer.getvalue())
-        items = [{
-            "discord_buffer": buffer,
-            "filename": "test.png",
-            "validated": True,
-        }]
+        items = [prepared_media(buffer, "test.png")]
         files = [discord.File(buffer, filename="test.png")]
 
         delivery = asyncio.run(sender.send_discord_payload(
@@ -170,10 +179,10 @@ class TestDiscord413Fallback:
         large_buffer = make_large_png_buffer()
         original_size = len(large_buffer.getvalue())
         items = [
-            {"discord_buffer": large_buffer, "filename": "large.png", "validated": True},
-            {"discord_buffer": io.BytesIO(b"second"), "filename": "second.jpg", "validated": True},
+            prepared_media(large_buffer, "large.png"),
+            prepared_media(io.BytesIO(b"second"), "second.jpg"),
         ]
-        files = [discord.File(item["discord_buffer"], filename=item["filename"]) for item in items]
+        files = [discord.File(item.discord_buffer, filename=item.filename) for item in items]
         embeds = [discord.Embed(), discord.Embed()]
 
         with patch("Module.message_sender.asyncio.sleep", AsyncMock()):

@@ -12,10 +12,27 @@ import discord
 import pytest
 from PIL import Image
 
-from Module.arca_bot import ArcaBot
+from Module.arca_bot import ArcaBot, MediaPreparation
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
 from Module.media_candidate import MediaCandidate
 from Module.media_download import MediaDownloadTooLarge
+from Module.media_pipeline import PreparedMedia
+
+
+def prepared_media(
+    filename: str,
+    content_hash: str,
+    data: bytes = b"image",
+) -> PreparedMedia:
+    return PreparedMedia(
+        discord_buffer=io.BytesIO(data),
+        telegram_buffer=io.BytesIO(data),
+        filename=filename,
+        content_hash=content_hash,
+        is_gif=False,
+        original_data=data,
+        validated=True,
+    )
 
 
 @pytest.fixture
@@ -133,10 +150,8 @@ async def test_process_post_with_images(mock_dependencies, bot):
     # Mock _download_and_process to return processed items
     bot._download_and_process = AsyncMock(
         return_value=([
-            {"discord_buffer": MagicMock(), "telegram_buffer": MagicMock(),
-             "filename": "1.jpg", "is_gif": False, "content_hash": "h1"},
-            {"discord_buffer": MagicMock(), "telegram_buffer": MagicMock(),
-             "filename": "2.jpg", "is_gif": False, "content_hash": "h2"},
+            prepared_media("1.jpg", "h1"),
+            prepared_media("2.jpg", "h2"),
         ], True)
     )
     bot._send_image_batch = AsyncMock(return_value=DeliveryResult((
@@ -185,16 +200,10 @@ async def test_process_post_retries_when_post_detail_fetch_fails(mock_dependenci
 
 @pytest.mark.asyncio
 async def test_concurrent_download_results_are_deduplicated_within_post(bot):
-    first = {
-        "discord_buffer": MagicMock(),
-        "telegram_buffer": MagicMock(),
-        "filename": "first.jpg",
-        "is_gif": False,
-        "content_hash": "same-hash",
-    }
-    duplicate = {**first, "filename": "duplicate.jpg"}
+    first = prepared_media("first.jpg", "same-hash")
+    duplicate = prepared_media("duplicate.jpg", "same-hash")
     bot._download_and_process_one = AsyncMock(
-        side_effect=[(first, True), (duplicate, True)]
+        side_effect=[MediaPreparation(first, True), MediaPreparation(duplicate, True)]
     )
 
     downloaded, all_resolved = await bot._download_and_process(
@@ -311,7 +320,7 @@ async def test_download_attempt_waits_after_failure(bot):
             "https://arca.live/b/test/1",
         )
 
-    assert result == (None, False)
+    assert result == MediaPreparation(None, False)
     mock_sleep.assert_awaited_once_with(0.5)
 
 
@@ -330,7 +339,7 @@ async def test_permanently_rejected_download_is_resolved(bot):
             "https://arca.live/b/test/1",
         )
 
-    assert result == (None, True)
+    assert result == MediaPreparation(None, True)
 
 
 @pytest.mark.asyncio
@@ -354,13 +363,7 @@ async def test_unresolved_media_prevents_post_ack_after_successful_delivery(mock
         MediaCandidate("https://ac-o.namu.la/1.jpg", filename_hint="1.jpg"),
         MediaCandidate("https://ac-o.namu.la/2.jpg", filename_hint="2.jpg"),
     ]
-    item = {
-        "discord_buffer": io.BytesIO(b"image"),
-        "telegram_buffer": io.BytesIO(b"image"),
-        "filename": "1.jpg",
-        "is_gif": False,
-        "content_hash": "h1",
-    }
+    item = prepared_media("1.jpg", "h1")
     bot._download_and_process = AsyncMock(return_value=([item], False))
     bot._send_image_batch = AsyncMock(return_value=DeliveryResult((
         ChannelDelivery(
@@ -383,11 +386,7 @@ async def test_unresolved_media_prevents_post_ack_after_successful_delivery(mock
 async def test_missing_arca_channel_records_reason_without_send(bot):
     bot.get_channel.return_value = None
     bot.message_sender.send_discord_payload = AsyncMock()
-    batch = [{
-        "discord_buffer": io.BytesIO(b"image"),
-        "filename": "1.jpg",
-        "content_hash": "h1",
-    }]
+    batch = [prepared_media("1.jpg", "h1")]
 
     result = await bot._send_image_batch(batch, "title", "https://arca.live/b/test/14", 0)
 
@@ -408,11 +407,7 @@ async def test_missing_arca_channel_records_reason_without_send(bot):
 
 @pytest.mark.asyncio
 async def test_arca_batch_delegates_to_shared_fanout_and_preserves_delay(bot):
-    batch = [{
-        "discord_buffer": io.BytesIO(b"first"),
-        "filename": "1.jpg",
-        "content_hash": "h1",
-    }]
+    batch = [prepared_media("1.jpg", "h1", b"first")]
     delivery_result = DeliveryResult((
         ChannelDelivery(
             transport="discord",
@@ -455,21 +450,9 @@ async def test_only_media_from_successful_arca_batch_are_hash_marked(
         MediaCandidate("https://ac-o.namu.la/2.jpg", filename_hint="2.jpg"),
     ]
     downloaded = [
-        {
-            "discord_buffer": io.BytesIO(b"first"),
-            "filename": "1.jpg",
-            "content_hash": "h1",
-        },
-        {
-            "discord_buffer": io.BytesIO(b"second"),
-            "filename": "2.jpg",
-            "content_hash": "h2",
-        },
-        {
-            "discord_buffer": io.BytesIO(b"third"),
-            "filename": "3.jpg",
-            "content_hash": "h3",
-        },
+        prepared_media("1.jpg", "h1", b"first"),
+        prepared_media("2.jpg", "h2", b"second"),
+        prepared_media("3.jpg", "h3", b"third"),
     ]
     bot._download_and_process = AsyncMock(return_value=(downloaded, True))
     successful_batch = DeliveryResult((

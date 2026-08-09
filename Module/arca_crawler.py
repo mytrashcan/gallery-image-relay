@@ -8,6 +8,7 @@ Gallery Image Relay의 Module/crawler.py와 동일한 인터페이스를 제공�
 import logging
 import os
 import re
+from typing import TypedDict
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import cloudscraper
@@ -37,6 +38,12 @@ _PAGE_RETRY_POLICY = RetryPolicy(
     base_delay=1.0,
     max_delay=4.0,
 )
+
+
+class ArcaPost(TypedDict):
+    link: str
+    title: str
+    post_id: str
 
 
 def _mask_proxy(url: str) -> str:
@@ -155,13 +162,13 @@ class ArcaliveCrawler:
 
     def __init__(
         self,
-        base_url,
+        base_url: str,
         session=None,
         *,
         retry_policy: RetryPolicy | None = None,
         gallery_name: str = "",
         delivery_archive: DeliveryArchive | None = None,
-    ):
+    ) -> None:
         self.base_url = base_url
         self.sent_items = LRUCache()
         self.session = session or _create_session()
@@ -173,7 +180,7 @@ class ArcaliveCrawler:
 
     # ---------- 포스트 목록 파싱 ----------
 
-    def get_latest_posts(self, max_posts=5):
+    def get_latest_posts(self, max_posts: int = 5) -> list[ArcaPost]:
         try:
             res = request_with_policy(
                 lambda: self.session.get(self.base_url, timeout=15),
@@ -190,7 +197,7 @@ class ArcaliveCrawler:
             return []
 
         soup = BeautifulSoup(res.text, "lxml", parse_only=_VROW_STRAINER)
-        posts = []
+        posts: list[ArcaPost] = []
 
         for vrow in soup.select("div.vrow.hybrid"):
             post = self._parse_hybrid_row(vrow)
@@ -204,7 +211,7 @@ class ArcaliveCrawler:
                     posts.append(post)
 
         posts = posts[POST_SKIP_COUNT:]
-        new_posts = []
+        new_posts: list[ArcaPost] = []
         for post in posts:
             if not self._has_sent(post["post_id"]):
                 new_posts.append(post)
@@ -235,7 +242,7 @@ class ArcaliveCrawler:
         self.sent_items.add(post_id)
         return True
 
-    def _parse_hybrid_row(self, vrow):
+    def _parse_hybrid_row(self, vrow) -> ArcaPost | None:
         if self._is_notice_row(vrow):
             return None
         title_el = vrow.select_one("a.title.hybrid-title")
@@ -248,7 +255,7 @@ class ArcaliveCrawler:
             return None
         return self._build_post(title_el.get_text(strip=True), href)
 
-    def _parse_column_row(self, vrow):
+    def _parse_column_row(self, vrow) -> ArcaPost | None:
         if self._is_notice_row(vrow):
             return None
         href = vrow.get("href", "")
@@ -267,7 +274,7 @@ class ArcaliveCrawler:
         return "notice" in classes or any(value.startswith("notice-") for value in classes)
 
     @classmethod
-    def _build_post(cls, title: str, href: str) -> dict | None:
+    def _build_post(cls, title: str, href: str) -> ArcaPost | None:
         link = _fixed_arca_url(ARCA_BASE, href)
         post_id = cls._extract_post_id(link or "")
         if link is None or not post_id:

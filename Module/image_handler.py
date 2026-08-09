@@ -4,7 +4,6 @@ import io
 import logging
 import math
 import os
-import warnings
 from math import ceil
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -51,19 +50,6 @@ class ImageHandler:
             raise ValueError(
                 "source and gallery_name are required when using a delivery archive"
             )
-
-    def _is_duplicate(self, content_hash: object) -> bool:
-        return self._seen_hashes.add_if_absent(content_hash)
-
-    def is_duplicate(self, content_hash: object) -> bool:
-        """Check and record a hash using the deprecated combined operation."""
-        warnings.warn(
-            "is_duplicate() is deprecated; use has_seen_hash() and "
-            "mark_hash_sent() so hashes are recorded only after delivery",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._is_duplicate(content_hash)
 
     def has_seen_hash(self, content_hash: str) -> bool:
         if content_hash in self._seen_hashes:
