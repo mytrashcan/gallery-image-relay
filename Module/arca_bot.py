@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import discord
 import requests
 
-from Module.arca_crawler import ArcaliveCrawler, _is_allowed_image_url
+from Module.arca_crawler import ArcaliveCrawler, ArcaPost, _is_allowed_image_url
 from Module.config import app_config
 from Module.delivery_archive import DeliveryArchive
 from Module.delivery_result import DeliveryResult
@@ -28,7 +28,7 @@ from Module.media_download import (
     VerifiedMedia,
     download_media_candidate,
 )
-from Module.media_pipeline import MediaPipeline
+from Module.media_pipeline import MediaPipeline, PreparedMedia
 from Module.message_sender import MessageSender
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,12 @@ INTER_IMAGE_DELAY = 1.0
 IMAGE_DOWNLOAD_DELAY = 0.5
 
 
+@dataclass(frozen=True, slots=True)
+class MediaPreparation:
+    item: PreparedMedia | None
+    resolved: bool
+
+
 class ArcaBot(discord.Client):
     """아카라이브 게시글을 크롤링하여 디스코드로 전송하는 봇.
 
@@ -52,7 +58,14 @@ class ArcaBot(discord.Client):
     게시글 내 모든 이미지를 추출하여 전송한다.
     """
 
-    def __init__(self, token: object, base_url: object, channel_ids: object, intents: object, gallery_name: object="") -> None:
+    def __init__(
+        self,
+        token: str,
+        base_url: str,
+        channel_ids: list[str],
+        intents: discord.Intents,
+        gallery_name: str = "",
+    ) -> None:
         super().__init__(intents=intents)
         self.token = token
         self.base_url = base_url
@@ -97,7 +110,7 @@ class ArcaBot(discord.Client):
             max(1, min(4, app_config.arca_download_concurrency))
         )
 
-    async def on_ready(self) -> object:
+    async def on_ready(self) -> None:
         logger.info(f"[아카라이브] Logged in as {self.user}")
 
     async def setup_hook(self) -> None:
@@ -117,7 +130,7 @@ class ArcaBot(discord.Client):
             self.delivery_archive.close()
         await super().close()
 
-    async def start_crawling(self) -> object:
+    async def start_crawling(self) -> None:
         """주기적으로 새 게시글을 폴링한다."""
         while True:
             try:
@@ -135,7 +148,7 @@ class ArcaBot(discord.Client):
             delay = random.uniform(30, 60)
             await asyncio.sleep(delay)
 
-    async def process_post(self, post: object) -> object:
+    async def process_post(self, post: ArcaPost) -> bool:
         """게시글 내 모든 이미지를 추출하여 디스코드로 전송한다."""
         images = await asyncio.to_thread(self.crawler.extract_all_images, post["link"])
         if images is None:
@@ -172,32 +185,31 @@ class ArcaBot(discord.Client):
             }
             # 성공 확정된 media만 hash 표시 (PARTIAL fallback 시 실패 항목은 재시도 대상 유지)
             for item in batch:
-                if item["content_hash"] in delivered_media:
-                    self.image_handler.mark_hash_sent(item["content_hash"])
+                if item.content_hash in delivered_media:
+                    self.image_handler.mark_hash_sent(item.content_hash)
             delivery_result = delivery_result.merge(batch_result)
         return delivery_result.acknowledged and all_resolved
 
     async def _download_and_process(
         self, images: list[MediaCandidate], link: str
-    ) -> tuple[list[dict[str, object]], bool]:
+    ) -> tuple[list[PreparedMedia], bool]:
         """이미지 URL 목록을 다운로드→압축→중복제거하여 전송 가능한 버퍼 목록으로 만든다."""
         results = await asyncio.gather(
             *(self._download_and_process_one(img_info, link) for img_info in images)
         )
-        return self._deduplicate_downloads(results), all(
-            resolved for _, resolved in results
-        )
+        return self._deduplicate_downloads(results), all(result.resolved for result in results)
 
     @staticmethod
-    def _deduplicate_downloads(results) -> list[dict[str, object]]:
+    def _deduplicate_downloads(results: list[MediaPreparation]) -> list[PreparedMedia]:
         unique_items = []
         seen_hashes = set()
-        for item, _ in results:
+        for result in results:
+            item = result.item
             if item is None:
                 continue
-            content_hash = item["content_hash"]
+            content_hash = item.content_hash
             if content_hash in seen_hashes:
-                logger.info("[아카라이브] 게시글 내 중복 이미지 스킵: %s", item["filename"])
+                logger.info("[아카라이브] 게시글 내 중복 이미지 스킵: %s", item.filename)
                 continue
             seen_hashes.add(content_hash)
             unique_items.append(item)
@@ -205,7 +217,7 @@ class ArcaBot(discord.Client):
 
     async def _download_and_process_one(
         self, candidate: MediaCandidate, link: str
-    ) -> tuple[dict[str, object] | None, bool]:
+    ) -> MediaPreparation:
         async with self._download_semaphore:
             filename = candidate.filename_hint or "arca-image"
             try:
@@ -215,7 +227,7 @@ class ArcaBot(discord.Client):
                     link,
                 )
                 if verified is None:
-                    return None, False
+                    return MediaPreparation(None, False)
 
                 discord_buffer, telegram_buffer, is_gif = await asyncio.to_thread(
                     self.image_handler.process_image,
@@ -225,28 +237,31 @@ class ArcaBot(discord.Client):
 
                 if self.image_handler.has_seen_hash(verified.content_hash):
                     logger.info(f"[아카라이브] 중복 이미지 스킵: {verified.filename}")
-                    return None, True
+                    return MediaPreparation(None, True)
 
-                return {
-                    "discord_buffer": discord_buffer,
-                    "telegram_buffer": telegram_buffer,
-                    "filename": verified.filename,
-                    "is_gif": is_gif,
-                    "original_data": verified.data,
-                    "content_hash": verified.content_hash,
-                    "validated": True,
-                }, True
+                return MediaPreparation(
+                    PreparedMedia(
+                        discord_buffer=discord_buffer,
+                        telegram_buffer=telegram_buffer,
+                        filename=verified.filename,
+                        content_hash=verified.content_hash,
+                        is_gif=is_gif,
+                        original_data=verified.data,
+                        validated=True,
+                    ),
+                    True,
+                )
             except MediaDownloadRejected as e:
                 logger.warning(
                     f"[아카라이브] 영구적으로 거절된 이미지 ({filename}): {e}"
                 )
-                return None, True
+                return MediaPreparation(None, True)
             except ValueError as e:
                 logger.warning(f"[아카라이브] 이미지 처리 실패 ({filename}): {e}")
-                return None, True
+                return MediaPreparation(None, True)
             except OSError as e:
                 logger.warning(f"[아카라이브] 이미지 처리 재시도 필요 ({filename}): {e}")
-                return None, False
+                return MediaPreparation(None, False)
 
             # Hold the semaphore slot briefly after every CDN attempt, including failures.
             finally:
@@ -278,7 +293,7 @@ class ArcaBot(discord.Client):
 
     async def _send_image_batch(
         self,
-        batch: list[dict[str, object]],
+        batch: list[PreparedMedia],
         title: str,
         link: str,
         batch_index: int,
@@ -296,6 +311,6 @@ class ArcaBot(discord.Client):
             await asyncio.sleep(INTER_IMAGE_DELAY)
         return delivery_result
 
-    async def run_bot(self) -> object:
+    async def run_bot(self) -> None:
         async with self:
             await self.start(self.token)

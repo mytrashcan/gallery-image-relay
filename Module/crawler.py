@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+from typing import TypedDict
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup, SoupStrainer
+from bs4.element import Tag
 
 from Module.config import BS_PARSER, HEADERS, REQUEST_TIMEOUT
 from Module.delivery_archive import DeliveryArchive, post_key
@@ -36,10 +38,17 @@ _PAGE_RETRY_POLICY = RetryPolicy(
 )
 
 
+class DCPost(TypedDict):
+    link: str
+    title: str
+    post_id: str
+    has_image: bool
+
+
 class DCInsideCrawler:
     def __init__(
         self,
-        base_url: object,
+        base_url: str,
         *,
         retry_policy: RetryPolicy | None = None,
         gallery_name: str = "",
@@ -55,11 +64,11 @@ class DCInsideCrawler:
         if delivery_archive is not None and not gallery_name:
             raise ValueError("gallery_name is required when using a delivery archive")
 
-    def image_check(self, element: object) -> object:
+    def image_check(self, element: Tag) -> bool:
         """이미지 포함 여부 체크"""
         return element.select_one(".icon_pic") is not None
 
-    def get_latest_post(self) -> object:
+    def get_latest_post(self) -> DCPost | None:
         """최신 게시글 정보 가져오기 (동기)"""
         try:
             res = request_with_policy(

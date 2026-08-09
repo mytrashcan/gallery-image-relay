@@ -58,7 +58,6 @@ def test_platform_limits_are_independent_and_capped_at_five():
 
 def test_pick_from_queue_schedules_spawn_failure_for_retry(monkeypatch):
     launcher.processes.clear()
-    launcher.restart_failures.clear()
     monkeypatch.setattr("launcher.is_already_running", lambda gallery_name: False)
     monkeypatch.setattr("launcher.time.monotonic", lambda: 50.0)
     monkeypatch.setattr("launcher.run_script", MagicMock(side_effect=OSError("fork failed")))
@@ -66,10 +65,13 @@ def test_pick_from_queue_schedules_spawn_failure_for_retry(monkeypatch):
     selected = launcher._pick_from_queue(deque(["dc"]), 1, "DC")
 
     assert selected == 1
-    assert launcher.processes["dc"] == (None, 52.0, 1)
-    assert launcher.restart_failures["dc"] == 1
+    assert launcher.processes["dc"] == launcher.CrawlerProcessState(
+        process=None,
+        started_at=None,
+        restart_at=52.0,
+        failures=1,
+    )
     launcher.processes.clear()
-    launcher.restart_failures.clear()
 
 
 def test_monitor_batch_restarts_only_crashed_process(monkeypatch):
@@ -80,36 +82,41 @@ def test_monitor_batch_restarts_only_crashed_process(monkeypatch):
     restarted = MagicMock()
     restarted.poll.return_value = None
     launcher.processes.clear()
-    launcher.processes.update({"dc-a": (healthy, 1.0), "dc-b": (crashed, 1.0)})
+    launcher.processes.update({
+        "dc-a": launcher.CrawlerProcessState(healthy, 1.0, None, 0),
+        "dc-b": launcher.CrawlerProcessState(crashed, 1.0, None, 0),
+    })
     monkeypatch.setattr("launcher.time.monotonic", lambda: 100.0)
     monkeypatch.setattr("launcher.time.time", lambda: 100.0)
     monkeypatch.setattr("launcher.run_script", MagicMock(return_value=restarted))
 
     launcher.monitor_batch({"dc-a", "dc-b"})
 
-    assert launcher.processes["dc-a"][0] is healthy
-    assert len(launcher.processes["dc-b"]) == 3
+    assert launcher.processes["dc-a"].process is healthy
+    assert launcher.processes["dc-b"].process is None
+    assert launcher.processes["dc-b"].failures == 1
 
     monkeypatch.setattr("launcher.time.monotonic", lambda: 103.0)
     launcher.monitor_batch({"dc-a", "dc-b"})
-    assert launcher.processes["dc-b"][0] is restarted
+    assert launcher.processes["dc-b"].process is restarted
     launcher.processes.clear()
 
 
 def test_monitor_batch_reschedules_when_restart_spawn_fails(monkeypatch):
     launcher.processes.clear()
-    launcher.restart_failures.clear()
-    launcher.processes["dc"] = (None, 99.0, 1)
-    launcher.restart_failures["dc"] = 1
+    launcher.processes["dc"] = launcher.CrawlerProcessState(None, None, 99.0, 1)
     monkeypatch.setattr("launcher.time.monotonic", lambda: 100.0)
     monkeypatch.setattr("launcher.run_script", MagicMock(side_effect=OSError("fork failed")))
 
     launcher.monitor_batch({"dc"})
 
-    assert launcher.processes["dc"] == (None, 104.0, 2)
-    assert launcher.restart_failures["dc"] == 2
+    assert launcher.processes["dc"] == launcher.CrawlerProcessState(
+        process=None,
+        started_at=None,
+        restart_at=104.0,
+        failures=2,
+    )
     launcher.processes.clear()
-    launcher.restart_failures.clear()
 
 
 def test_stopping_dc_batch_does_not_stop_arca(monkeypatch):
@@ -118,7 +125,10 @@ def test_stopping_dc_batch_does_not_stop_arca(monkeypatch):
     arca = MagicMock()
     arca.poll.return_value = None
     launcher.processes.clear()
-    launcher.processes.update({"dc": (dc, 1.0), "arca": (arca, 1.0)})
+    launcher.processes.update({
+        "dc": launcher.CrawlerProcessState(dc, 1.0, None, 0),
+        "arca": launcher.CrawlerProcessState(arca, 1.0, None, 0),
+    })
     monkeypatch.setattr("launcher.time.monotonic", lambda: 1.0)
 
     launcher.stop_processes({"dc"}, timeout=0)

@@ -7,10 +7,10 @@ import random
 import discord
 
 from Module.config import app_config
-from Module.crawler import DCInsideCrawler
+from Module.crawler import DCInsideCrawler, DCPost
 from Module.delivery_archive import DeliveryArchive
 from Module.image_handler import ImageHandler
-from Module.media_pipeline import MediaPipeline
+from Module.media_pipeline import MediaPipeline, PreparedMedia
 from Module.message_sender import MessageSender
 from Module.process_leader import ProcessLeaderLock
 
@@ -21,7 +21,16 @@ CLEAR_CACHE_COMMAND = "!쓰담쓰담"
 
 
 class DCBot(discord.Client):
-    def __init__(self, token: object, base_url: object, channel_ids: object, telegram_token: object, telegram_chat_id: object, intents: object, gallery_name: object="") -> None:
+    def __init__(
+        self,
+        token: str,
+        base_url: str,
+        channel_ids: list[str],
+        telegram_token: str,
+        telegram_chat_id: str,
+        intents: discord.Intents,
+        gallery_name: str = "",
+    ) -> None:
         super().__init__(intents=intents)
         self.token = token
         self.base_url = base_url
@@ -53,7 +62,7 @@ class DCBot(discord.Client):
         self._crawler_task: asyncio.Task | None = None
         self._command_leader = ProcessLeaderLock()
 
-    async def on_ready(self) -> object:
+    async def on_ready(self) -> None:
         logger.info(f"Logged in as {self.user}")
 
     async def setup_hook(self) -> None:
@@ -74,7 +83,7 @@ class DCBot(discord.Client):
             self.delivery_archive.close()
         await super().close()
 
-    async def start_crawling(self) -> object:
+    async def start_crawling(self) -> None:
         while True:
             try:
                 post = await asyncio.to_thread(self.crawler.get_latest_post)
@@ -89,7 +98,7 @@ class DCBot(discord.Client):
             delay = random.uniform(20, 40)
             await asyncio.sleep(delay)
 
-    async def process_post(self, post: object) -> object:
+    async def process_post(self, post: DCPost) -> bool:
         # blocking I/O를 별도 스레드에서 실행
         images = await asyncio.to_thread(self.image_handler.download_images, post['link'])
         if images is None:
@@ -98,15 +107,15 @@ class DCBot(discord.Client):
             return True
 
         media_items = [
-            {
-                "discord_buffer": discord_buffer,
-                "telegram_buffer": telegram_buffer,
-                "filename": filename,
-                "is_gif": is_gif,
-                "original_data": original_data,
-                "content_hash": content_hash,
-                "validated": True,
-            }
+            PreparedMedia(
+                discord_buffer=discord_buffer,
+                telegram_buffer=telegram_buffer,
+                filename=filename,
+                content_hash=content_hash,
+                is_gif=is_gif,
+                original_data=original_data,
+                validated=True,
+            )
             for discord_buffer, telegram_buffer, filename, is_gif, original_data, content_hash in images
         ]
 
@@ -118,10 +127,10 @@ class DCBot(discord.Client):
         )
         if delivery_result.acknowledged:
             for item in media_items:
-                self.image_handler.mark_hash_sent(item["content_hash"])
+                self.image_handler.mark_hash_sent(item.content_hash)
         return delivery_result.acknowledged
 
-    async def on_message(self, message: object) -> object:
+    async def on_message(self, message: discord.Message) -> None:
         if message.author == self.user:
             return
 
@@ -140,6 +149,6 @@ class DCBot(discord.Client):
             embed.set_image(url="attachment://gaki.png")
             await message.channel.send(embed=embed, file=file)
 
-    async def run_bot(self) -> object:
+    async def run_bot(self) -> None:
         async with self:
             await self.start(self.token)

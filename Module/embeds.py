@@ -8,7 +8,14 @@ from __future__ import annotations
 import discord
 
 
-def make_image_embed(filename: object, *, title: object=None, url: object=None, color: object, footer: object=None) -> object:
+def make_image_embed(
+    filename: str,
+    *,
+    title: str | None = None,
+    url: str | None = None,
+    color: int,
+    footer: str | None = None,
+) -> discord.Embed:
     """첨부 이미지를 보여주는 임베드를 만든다.
 
     title/url이 있으면 제목이 하이퍼링크가 되고, footer가 있으면 하단에 표시한다.

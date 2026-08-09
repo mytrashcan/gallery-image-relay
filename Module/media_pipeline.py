@@ -1,5 +1,8 @@
 import asyncio
 import logging
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from io import BytesIO
 
 import discord
 
@@ -8,6 +11,17 @@ from Module.embeds import make_image_embed
 from Module.gallery_client import GalleryClient
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class PreparedMedia:
+    discord_buffer: BytesIO
+    telegram_buffer: BytesIO
+    filename: str
+    content_hash: str
+    is_gif: bool
+    original_data: bytes
+    validated: bool = False
 
 
 class MediaPipeline:
@@ -140,21 +154,21 @@ class MediaPipeline:
             ))
 
     @staticmethod
-    def _web_image_data(image_item) -> bytes:
+    def _web_image_data(image_item: PreparedMedia) -> bytes:
         from Module.config import app_config
 
-        original = image_item.get("original_data") or b""
+        original = image_item.original_data or b""
         if len(original) <= app_config.web_ingest_max_mb * 1024 * 1024:
-            return original or image_item["discord_buffer"].getvalue()
-        return image_item["discord_buffer"].getvalue()
+            return original or image_item.discord_buffer.getvalue()
+        return image_item.discord_buffer.getvalue()
 
     @staticmethod
-    def _media_ids(items) -> tuple[str, ...]:
-        return tuple(str(item.get("content_hash") or item["filename"]) for item in items)
+    def _media_ids(items: Iterable[PreparedMedia]) -> tuple[str, ...]:
+        return tuple(str(item.content_hash or item.filename) for item in items)
 
     def _build_discord_payload(
         self,
-        items,
+        items: Sequence[PreparedMedia],
         *,
         title: str,
         link: str | None,
@@ -163,9 +177,9 @@ class MediaPipeline:
         files = []
         embeds = []
         for item_index, item in enumerate(items):
-            image_buffer = item["discord_buffer"]
+            image_buffer = item.discord_buffer
             image_buffer.seek(0)
-            filename = item["filename"]
+            filename = item.filename
             global_index = start_index + item_index
             is_first_global_image = global_index == 0
 
@@ -185,7 +199,7 @@ class MediaPipeline:
 
     async def _attach_successful_batch_to_web(
         self,
-        items,
+        items: Sequence[PreparedMedia],
         *,
         title: str,
         link: str | None,
@@ -200,7 +214,7 @@ class MediaPipeline:
                 continue
             web_result = await self.attach_to_web_gallery(
                 self._web_image_data(item),
-                item["filename"],
+                item.filename,
                 start_index + item_index,
                 title,
                 link or "",
@@ -211,7 +225,7 @@ class MediaPipeline:
 
     async def send_discord_batch(
         self,
-        items,
+        items: Iterable[PreparedMedia],
         *,
         title: str,
         link: str | None,
@@ -285,7 +299,7 @@ class MediaPipeline:
 
     async def distribute(
         self,
-        images,
+        images: Sequence[PreparedMedia],
         *,
         title="",
         link=None,
@@ -297,9 +311,9 @@ class MediaPipeline:
         total = len(images)
         result = DeliveryResult(())
         for global_index, image_item in enumerate(images):
-            telegram_buffer = image_item["telegram_buffer"]
-            filename = image_item["filename"]
-            is_gif = image_item["is_gif"]
+            telegram_buffer = image_item.telegram_buffer
+            filename = image_item.filename
+            is_gif = image_item.is_gif
             requested_media = self._media_ids((image_item,))
 
             discord_result = await self.send_discord_batch(
@@ -315,7 +329,7 @@ class MediaPipeline:
                     telegram_buffer,
                     filename,
                     is_gif,
-                    validated=image_item.get("validated", False),
+                    validated=image_item.validated,
                 )
                 telegram_chat_id = getattr(self.message_sender, "telegram_chat_id", "")
                 result = result.merge(DeliveryResult((

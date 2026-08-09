@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
+from types import FrameType
 from urllib import error, request
 
 import psutil
@@ -35,8 +37,16 @@ gallery_names = list(gallery_configs.keys())
 dc_galleries = deque(g for g in gallery_names if gallery_configs[g].get("type") != "arca")
 arca_galleries = deque(g for g in gallery_names if gallery_configs[g].get("type") == "arca")
 
-processes = {}  # {gallery_name: (process, start_time)}
-restart_failures: dict[str, int] = {}
+
+@dataclass(slots=True)
+class CrawlerProcessState:
+    process: subprocess.Popen[bytes] | None
+    started_at: float | None
+    restart_at: float | None
+    failures: int
+
+
+processes: dict[str, CrawlerProcessState] = {}
 
 MAX_DC = min(5, max(1, int(os.getenv("MAX_DC_CRAWLERS", "5"))))
 MAX_ARCA = min(5, max(1, int(os.getenv("MAX_ARCA_CRAWLERS", "5"))))
@@ -110,7 +120,7 @@ def wait_for_web_gallery() -> bool:
             return False
         time.sleep(1)
 
-def signal_handler(sig: object, frame: object) -> object:
+def signal_handler(sig: int, frame: FrameType | None) -> None:
     global shutdown_requested
     logger.info("종료 신호 수신. 프로세스를 정리합니다...")
     shutdown_requested = True
@@ -118,7 +128,7 @@ def signal_handler(sig: object, frame: object) -> object:
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def is_already_running(gallery_name: object) -> object:
+def is_already_running(gallery_name: str) -> bool:
     """해당 갤러리가 이미 실행 중인지 확인"""
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
@@ -132,7 +142,7 @@ def is_already_running(gallery_name: object) -> object:
             continue
     return False
 
-def run_script(gallery_name: object) -> object:
+def run_script(gallery_name: str) -> subprocess.Popen[bytes]:
     """run_gallery.py를 통해 갤러리 크롤러 실행 (DCInside/Arcalive 모두)"""
     python_executable = sys.executable
     process = subprocess.Popen(
@@ -144,9 +154,9 @@ def run_script(gallery_name: object) -> object:
 def stop_processes(gallery_names: set[str], timeout: float = 10.0) -> None:
     """Terminate selected processes concurrently within one shared deadline."""
     running = [
-        (gallery_name, entry[0])
-        for gallery_name, entry in processes.items()
-        if gallery_name in gallery_names and entry and entry[0] is not None
+        (gallery_name, state.process)
+        for gallery_name, state in processes.items()
+        if gallery_name in gallery_names and state.process is not None
     ]
     for gallery_name, process in running:
         logger.info(f"{gallery_name} 크롤러 종료 중...")
@@ -171,10 +181,9 @@ def stop_processes(gallery_names: set[str], timeout: float = 10.0) -> None:
             logger.error("강제 종료 후에도 프로세스가 남아 있습니다: pid=%s", process.pid)
     for gallery_name in gallery_names:
         processes.pop(gallery_name, None)
-        restart_failures.pop(gallery_name, None)
 
 
-def stop_running_processes(timeout: float = 10.0) -> object:
+def stop_running_processes(timeout: float = 10.0) -> None:
     """Terminate the whole batch concurrently within one shared deadline."""
     stop_processes(set(processes), timeout)
 
@@ -183,7 +192,7 @@ def _restart_delay(failures: int) -> float:
     return min(RESTART_BACKOFF_MAX, 2 ** min(failures, 6))
 
 
-def _pick_from_queue(queue: object, max_count: object, source_label: object) -> object:
+def _pick_from_queue(queue: deque[str], max_count: int, source_label: str) -> int:
     """큐에서 최대 max_count개의 갤러리를 선택 (실행 중이면 건너뜀)"""
     selected = 0
     launched = 0
@@ -199,10 +208,15 @@ def _pick_from_queue(queue: object, max_count: object, source_label: object) -> 
             try:
                 process = run_script(gallery_name)
             except (OSError, subprocess.SubprocessError) as exc:
-                failures = restart_failures.get(gallery_name, 0) + 1
-                restart_failures[gallery_name] = failures
+                previous_state = processes.get(gallery_name)
+                failures = (previous_state.failures if previous_state else 0) + 1
                 delay = _restart_delay(failures)
-                processes[gallery_name] = (None, time.monotonic() + delay, failures)
+                processes[gallery_name] = CrawlerProcessState(
+                    process=None,
+                    started_at=None,
+                    restart_at=time.monotonic() + delay,
+                    failures=failures,
+                )
                 scheduled += 1
                 logger.error(
                     "%s 크롤러 시작 실패(%s). %.1f초 후 다시 시도합니다.",
@@ -211,7 +225,13 @@ def _pick_from_queue(queue: object, max_count: object, source_label: object) -> 
                     delay,
                 )
             else:
-                processes[gallery_name] = (process, time.time())
+                previous_state = processes.get(gallery_name)
+                processes[gallery_name] = CrawlerProcessState(
+                    process=process,
+                    started_at=time.time(),
+                    restart_at=None,
+                    failures=previous_state.failures if previous_state else 0,
+                )
                 launched += 1
             selected += 1
         else:
@@ -232,16 +252,16 @@ def monitor_batch(expected_galleries: set[str]) -> None:
     """Restart only crashed members of the active platform-limited batch."""
     now = time.monotonic()
     for gallery_name in expected_galleries:
-        entry = processes.get(gallery_name)
-        if entry is None or len(entry) != 2:
+        state = processes.get(gallery_name)
+        if state is None or state.process is None:
             continue
-        process, started_at = entry
+        process = state.process
         return_code = process.poll()
         if return_code is None:
             continue
-        failures = restart_failures.get(gallery_name, 0) + 1
-        restart_failures[gallery_name] = failures
+        failures = state.failures + 1
         delay = _restart_delay(failures)
+        started_at = state.started_at if state.started_at is not None else time.time()
         logger.warning(
             "%s 크롤러 종료(code=%s, uptime=%.1fs). %.1f초 후 재시작합니다.",
             gallery_name,
@@ -249,22 +269,30 @@ def monitor_batch(expected_galleries: set[str]) -> None:
             max(0.0, time.time() - started_at),
             delay,
         )
-        processes[gallery_name] = (None, now + delay, failures)
+        processes[gallery_name] = CrawlerProcessState(
+            process=None,
+            started_at=None,
+            restart_at=now + delay,
+            failures=failures,
+        )
 
     for gallery_name in expected_galleries:
-        entry = processes.get(gallery_name)
-        if not entry or len(entry) != 3:
+        state = processes.get(gallery_name)
+        if state is None or state.process is not None or state.restart_at is None:
             continue
-        _, restart_at, failures = entry
-        if now < restart_at:
+        if now < state.restart_at:
             continue
         try:
             process = run_script(gallery_name)
         except (OSError, subprocess.SubprocessError) as exc:
-            failures += 1
-            restart_failures[gallery_name] = failures
+            failures = state.failures + 1
             delay = _restart_delay(failures)
-            processes[gallery_name] = (None, now + delay, failures)
+            processes[gallery_name] = CrawlerProcessState(
+                process=None,
+                started_at=None,
+                restart_at=now + delay,
+                failures=failures,
+            )
             logger.error(
                 "%s 크롤러 재시작 실패(%s). %.1f초 후 다시 시도합니다.",
                 gallery_name,
@@ -272,9 +300,15 @@ def monitor_batch(expected_galleries: set[str]) -> None:
                 delay,
             )
             continue
-        processes[gallery_name] = (process, time.time())
+        processes[gallery_name] = CrawlerProcessState(
+            process=process,
+            started_at=time.time(),
+            restart_at=None,
+            failures=state.failures,
+        )
 
-def manage_crawlers() -> object:
+
+def manage_crawlers() -> None:
     """Run independent DC and Arca batches, each capped at five crawlers."""
     logger.info(f"DC 갤러리: {len(dc_galleries)}개, Arca 갤러리: {len(arca_galleries)}개")
     _pick_from_queue(dc_galleries, MAX_DC, "DC")
@@ -306,7 +340,7 @@ def manage_crawlers() -> object:
 
         time.sleep(1)
 
-def main() -> object:
+def main() -> None:
     """메인 실행 함수"""
     logger.info("크롤러 관리 프로세스를 시작합니다.")
     if not wait_for_web_gallery():

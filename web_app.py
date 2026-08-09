@@ -9,6 +9,7 @@ import logging
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
@@ -221,7 +222,10 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return HTMLResponse(f.read_text(encoding="utf-8"))
 
     @app.middleware("http")
-    async def cache_control(request: object, call_next: object) -> object:
+    async def cache_control(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         path = request.url.path
         resp = await call_next(request)
         if path.startswith("/images/") or path in ("/feed", "/"):
@@ -229,7 +233,10 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return resp
 
     @app.middleware("http")
-    async def security_headers(request: object, call_next: object) -> object:
+    async def security_headers(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
         resp = await call_next(request)
         # 클릭재킹/MIME 스니핑/과도한 리퍼러 유출 방지 + HTTPS 유지. 부작용 위험이
         # 없는 헤더만 넣는다. CSP는 넣지 않음: 이 사이트는 GA/Turnstile 스크립트를
@@ -249,7 +256,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return HTMLResponse(body, status_code=503, headers={"Retry-After": "3600"})
 
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> object:
+    async def index() -> Response:
         if _maintenance_on():
             return _maintenance_response()
         idx = static_dir / "index.html"
@@ -260,23 +267,23 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return HTMLResponse(html)
 
     @app.get("/policy", response_class=HTMLResponse)
-    async def policy() -> object:
+    async def policy() -> Response:
         return _page("policy.html")
 
     @app.get("/privacy", response_class=HTMLResponse)
-    async def privacy() -> object:
+    async def privacy() -> Response:
         return _page("privacy.html")
 
     @app.get("/about", response_class=HTMLResponse)
-    async def about() -> object:
+    async def about() -> Response:
         return _page("about.html")
 
     @app.get("/changelog", response_class=HTMLResponse)
-    async def changelog() -> object:
+    async def changelog() -> Response:
         return _page("changelog.html")
 
     @app.get("/request", response_class=HTMLResponse)
-    async def request_gallery() -> object:
+    async def request_gallery() -> Response:
         return _page("request.html")
 
     # 브라우저가 루트 경로로 직접 요청하는 파비콘들. 내용이 안 바뀌므로 캐시 헤더 부여.
@@ -292,8 +299,11 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         ("icon-192.png", "image/png"),
         ("icon-512.png", "image/png"),
     ):
-        def _make_favicon_route(fname: object=_fname, mime: object=_mime) -> object:
-            async def _serve() -> object:
+        def _make_favicon_route(
+            fname: str = _fname,
+            mime: str = _mime,
+        ) -> Callable[[], Awaitable[Response]]:
+            async def _serve() -> Response:
                 f = static_dir / fname
                 if not f.exists():
                     return PlainTextResponse("", status_code=404)
@@ -303,7 +313,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         app.add_api_route(f"/{_fname}", _make_favicon_route(), methods=["GET"])
 
     @app.get("/.well-known/security.txt", response_class=PlainTextResponse)
-    async def security_txt() -> object:
+    async def security_txt() -> Response:
         # RFC 9116: 보안 취약점 제보 연락처
         f = static_dir / "security.txt"
         if not f.exists():
@@ -318,7 +328,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         title: str = Query("", max_length=500),
         link: str = Query("", max_length=2048),
         gallery: str = Query("", max_length=100),
-    ) -> object:
+    ) -> Response:
         expected = app_config.web_ingest_token
         supplied = request.headers.get("x-ingest-token", "")
         # bytes로 비교: str 오버로드는 non-ASCII 입력에 TypeError를 던지므로(latin-1로
@@ -352,7 +362,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return JSONResponse(item)
 
     @app.get("/images/{image_id}")
-    async def image(image_id: str, thumbnail: bool = False) -> object:
+    async def image(image_id: str, thumbnail: bool = False) -> Response:
         found = gallery_store.get(image_id, thumbnail=thumbnail)
         if found is None:
             return Response(status_code=404, headers={"Cache-Control": "no-store"})
@@ -360,7 +370,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return Response(data, media_type=media_type, headers={"Cache-Control": "no-store"})
 
     @app.get("/feed")
-    async def feed(request: Request, limit: int = Query(60, ge=1, le=200)) -> object:
+    async def feed(request: Request, limit: int = Query(60, ge=1, le=200)) -> Response:
         if _rate_limited(_feed_ip_rate, _client_ip(request), _FEED_RATE_WINDOW, _FEED_RATE_MAX):
             return JSONResponse({"error": "too many requests"}, status_code=429)
         if _maintenance_on() and request.headers.get("cf-connecting-ip"):
@@ -373,7 +383,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return JSONResponse(gallery_store.snapshot(limit))
 
     @app.post("/verify")
-    async def verify(request: Request) -> object:
+    async def verify(request: Request) -> Response:
         if not _ts_enabled():
             return JSONResponse({"ok": True})
         raw_body = await _read_verify_body(request)
@@ -396,7 +406,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return resp
 
     @app.post("/like/{image_id}")
-    async def like(image_id: str, request: Request) -> object:
+    async def like(image_id: str, request: Request) -> Response:
         ip = _client_ip(request)
         if _rate_limited(_like_ip_rate, ip, _LIKE_RATE_WINDOW, _LIKE_RATE_MAX):
             return JSONResponse({"error": "too many requests"}, status_code=429)
@@ -411,7 +421,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         return JSONResponse({"id": image_id, "likes": n})
 
     @app.get("/healthz")
-    async def healthz() -> object:
+    async def healthz() -> Response:
         stats = gallery_store.stats()
         latest_age = stats["latest_age_seconds"]
         if latest_age is None:

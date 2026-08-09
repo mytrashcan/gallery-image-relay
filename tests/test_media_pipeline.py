@@ -5,7 +5,32 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
-from Module.media_pipeline import MediaPipeline
+from Module.media_pipeline import MediaPipeline, PreparedMedia
+
+
+def prepared_media(
+    filename: str = "image.jpg",
+    content_hash: str = "",
+    *,
+    discord_buffer: io.BytesIO | None = None,
+    telegram_buffer: io.BytesIO | None = None,
+    is_gif: bool = False,
+    original_data: bytes = b"",
+    validated: bool = False,
+) -> PreparedMedia:
+    if discord_buffer is None:
+        discord_buffer = io.BytesIO()
+    if telegram_buffer is None:
+        telegram_buffer = io.BytesIO(discord_buffer.getvalue())
+    return PreparedMedia(
+        discord_buffer=discord_buffer,
+        telegram_buffer=telegram_buffer,
+        filename=filename,
+        content_hash=content_hash,
+        is_gif=is_gif,
+        original_data=original_data,
+        validated=validated,
+    )
 
 
 def discord_delivery(
@@ -85,14 +110,13 @@ async def test_dc_single_and_arca_multi_use_shared_discord_payload_builder() -> 
     )
     dc_builder = MagicMock(wraps=dc_pipeline._build_discord_payload)
     dc_pipeline._build_discord_payload = dc_builder
-    dc_item = {
-        "discord_buffer": io.BytesIO(b"dc"),
-        "telegram_buffer": io.BytesIO(b"dc"),
-        "filename": "dc.jpg",
-        "is_gif": False,
-        "content_hash": "dc-hash",
-        "validated": True,
-    }
+    dc_item = prepared_media(
+        "dc.jpg",
+        "dc-hash",
+        discord_buffer=io.BytesIO(b"dc"),
+        telegram_buffer=io.BytesIO(b"dc"),
+        validated=True,
+    )
 
     await dc_pipeline.distribute(
         [dc_item],
@@ -106,8 +130,8 @@ async def test_dc_single_and_arca_multi_use_shared_discord_payload_builder() -> 
     arca_builder = MagicMock(wraps=arca_pipeline._build_discord_payload)
     arca_pipeline._build_discord_payload = arca_builder
     arca_batch = [
-        {"discord_buffer": io.BytesIO(b"a"), "filename": "a.jpg", "content_hash": "h1"},
-        {"discord_buffer": io.BytesIO(b"b"), "filename": "b.jpg", "content_hash": "h2"},
+        prepared_media("a.jpg", "h1", discord_buffer=io.BytesIO(b"a")),
+        prepared_media("b.jpg", "h2", discord_buffer=io.BytesIO(b"b")),
     ]
 
     await arca_pipeline.send_discord_batch(
@@ -125,15 +149,15 @@ async def test_dc_single_and_arca_multi_use_shared_discord_payload_builder() -> 
 def test_discord_payload_uses_source_specific_footer_counts() -> None:
     dc_pipeline = MediaPipeline(MagicMock(), MagicMock(), [], source_label="디시인사이드")
     _, dc_embeds = dc_pipeline._build_discord_payload(
-        [{"discord_buffer": io.BytesIO(b"dc"), "filename": "dc.jpg"}],
+        [prepared_media("dc.jpg", discord_buffer=io.BytesIO(b"dc"))],
         title="DC 제목",
         link="https://gall.dcinside.com/1",
     )
     arca_pipeline = MediaPipeline(MagicMock(), MagicMock(), [], source_label="아카라이브")
     _, arca_embeds = arca_pipeline._build_discord_payload(
         [
-            {"discord_buffer": io.BytesIO(b"a"), "filename": "a.jpg"},
-            {"discord_buffer": io.BytesIO(b"b"), "filename": "b.jpg"},
+            prepared_media("a.jpg", discord_buffer=io.BytesIO(b"a")),
+            prepared_media("b.jpg", discord_buffer=io.BytesIO(b"b")),
         ],
         title="Arca 제목",
         link="https://arca.live/1",
@@ -147,8 +171,8 @@ def test_discord_payload_uses_source_specific_footer_counts() -> None:
 def test_only_first_global_embed_has_post_metadata() -> None:
     pipeline = MediaPipeline(MagicMock(), MagicMock(), [])
     batch = [
-        {"discord_buffer": io.BytesIO(b"a"), "filename": "a.jpg"},
-        {"discord_buffer": io.BytesIO(b"b"), "filename": "b.jpg"},
+        prepared_media("a.jpg", discord_buffer=io.BytesIO(b"a")),
+        prepared_media("b.jpg", discord_buffer=io.BytesIO(b"b")),
     ]
 
     _, first_batch_embeds = pipeline._build_discord_payload(
@@ -189,12 +213,12 @@ async def test_any_successful_discord_channel_acknowledges_batch_without_retry()
     pipeline = MediaPipeline(sender, client, [111, 222])
 
     result = await pipeline.send_discord_batch(
-        [{
-            "discord_buffer": io.BytesIO(b"x"),
-            "filename": "a.jpg",
-            "content_hash": "hash-a",
-            "validated": True,
-        }],
+        [prepared_media(
+            "a.jpg",
+            "hash-a",
+            discord_buffer=io.BytesIO(b"x"),
+            validated=True,
+        )],
         title="title",
         link="https://example.com/1",
     )
@@ -219,11 +243,7 @@ async def test_missing_channel_records_channel_not_found() -> None:
     pipeline = MediaPipeline(sender, client, [111])
 
     result = await pipeline.send_discord_batch(
-        [{
-            "discord_buffer": io.BytesIO(b"x"),
-            "filename": "a.jpg",
-            "content_hash": "hash-a",
-        }],
+        [prepared_media("a.jpg", "hash-a", discord_buffer=io.BytesIO(b"x"))],
         title="title",
         link=None,
     )
@@ -255,14 +275,13 @@ async def test_telegram_success_acknowledges_failed_discord() -> None:
     client.get_channel.return_value = MagicMock()
     pipeline = MediaPipeline(sender, client, [111])
 
-    result = await pipeline.distribute([{
-        "discord_buffer": io.BytesIO(b"discord"),
-        "telegram_buffer": io.BytesIO(b"telegram"),
-        "filename": "a.jpg",
-        "is_gif": False,
-        "content_hash": "hash-a",
-        "validated": True,
-    }])
+    result = await pipeline.distribute([prepared_media(
+        "a.jpg",
+        "hash-a",
+        discord_buffer=io.BytesIO(b"discord"),
+        telegram_buffer=io.BytesIO(b"telegram"),
+        validated=True,
+    )])
 
     assert result.acknowledged is True
     assert [delivery.outcome for delivery in result.deliveries] == [
@@ -284,14 +303,13 @@ async def test_all_destination_failures_are_not_acknowledged() -> None:
     client.get_channel.return_value = MagicMock()
     pipeline = MediaPipeline(sender, client, [111])
 
-    result = await pipeline.distribute([{
-        "discord_buffer": io.BytesIO(b"discord"),
-        "telegram_buffer": io.BytesIO(b"telegram"),
-        "filename": "a.jpg",
-        "is_gif": False,
-        "content_hash": "hash-a",
-        "validated": True,
-    }])
+    result = await pipeline.distribute([prepared_media(
+        "a.jpg",
+        "hash-a",
+        discord_buffer=io.BytesIO(b"discord"),
+        telegram_buffer=io.BytesIO(b"telegram"),
+        validated=True,
+    )])
 
     assert result.acknowledged is False
     assert all(delivery.outcome is DeliveryOutcome.FAILED for delivery in result.deliveries)
@@ -323,8 +341,8 @@ async def test_discord_payload_is_rebuilt_and_buffers_are_rewound_per_channel() 
     client.get_channel.side_effect = [MagicMock(), MagicMock()]
     pipeline = MediaPipeline(sender, client, [111, 222])
     batch = [
-        {"discord_buffer": io.BytesIO(b"first"), "filename": "first.jpg", "content_hash": "h1"},
-        {"discord_buffer": io.BytesIO(b"second"), "filename": "second.jpg", "content_hash": "h2"},
+        prepared_media("first.jpg", "h1", discord_buffer=io.BytesIO(b"first")),
+        prepared_media("second.jpg", "h2", discord_buffer=io.BytesIO(b"second")),
     ]
 
     result = await pipeline.send_discord_batch(
@@ -353,22 +371,21 @@ async def test_dc_distribution_preserves_per_image_telegram_calls_and_delay() ->
     first_telegram = io.BytesIO(b"telegram-1")
     second_telegram = io.BytesIO(b"telegram-2")
     images = [
-        {
-            "discord_buffer": io.BytesIO(b"discord-1"),
-            "telegram_buffer": first_telegram,
-            "filename": "first.jpg",
-            "is_gif": False,
-            "content_hash": "h1",
-            "validated": True,
-        },
-        {
-            "discord_buffer": io.BytesIO(b"discord-2"),
-            "telegram_buffer": second_telegram,
-            "filename": "second.gif",
-            "is_gif": True,
-            "content_hash": "h2",
-            "validated": True,
-        },
+        prepared_media(
+            "first.jpg",
+            "h1",
+            discord_buffer=io.BytesIO(b"discord-1"),
+            telegram_buffer=first_telegram,
+            validated=True,
+        ),
+        prepared_media(
+            "second.gif",
+            "h2",
+            discord_buffer=io.BytesIO(b"discord-2"),
+            telegram_buffer=second_telegram,
+            is_gif=True,
+            validated=True,
+        ),
     ]
 
     with patch("Module.media_pipeline.asyncio.sleep", AsyncMock()) as sleep:
@@ -417,14 +434,13 @@ async def test_dc_web_enqueue_is_independent_of_delivery_ack() -> None:
     )
     pipeline.attach_to_web_gallery = AsyncMock(return_value=DeliveryResult((web_delivery,)))
 
-    result = await pipeline.distribute([{
-        "discord_buffer": io.BytesIO(b"discord"),
-        "telegram_buffer": io.BytesIO(b"telegram"),
-        "filename": "a.jpg",
-        "is_gif": False,
-        "content_hash": "hash-a",
-        "validated": True,
-    }])
+    result = await pipeline.distribute([prepared_media(
+        "a.jpg",
+        "hash-a",
+        discord_buffer=io.BytesIO(b"discord"),
+        telegram_buffer=io.BytesIO(b"telegram"),
+        validated=True,
+    )])
 
     pipeline.attach_to_web_gallery.assert_awaited_once()
     assert result.deliveries[-1] is web_delivery
@@ -474,16 +490,8 @@ async def test_arca_web_enqueue_requires_successful_discord_batch(
         ),
     )))
     batch = [
-        {
-            "discord_buffer": io.BytesIO(b"first"),
-            "filename": "first.jpg",
-            "content_hash": "h1",
-        },
-        {
-            "discord_buffer": io.BytesIO(b"second"),
-            "filename": "second.jpg",
-            "content_hash": "h2",
-        },
+        prepared_media("first.jpg", "h1", discord_buffer=io.BytesIO(b"first")),
+        prepared_media("second.jpg", "h2", discord_buffer=io.BytesIO(b"second")),
     ]
 
     result = await pipeline.send_discord_batch(
@@ -537,11 +545,11 @@ def test_web_image_uses_original_only_within_ingest_limit(monkeypatch) -> None:
     monkeypatch.setattr("Module.config.app_config.web_ingest_max_mb", 1)
     compressed = io.BytesIO(b"compressed")
 
-    assert MediaPipeline._web_image_data({
-        "original_data": b"original",
-        "discord_buffer": compressed,
-    }) == b"original"
-    assert MediaPipeline._web_image_data({
-        "original_data": b"x" * (1024 * 1024 + 1),
-        "discord_buffer": compressed,
-    }) == b"compressed"
+    assert MediaPipeline._web_image_data(prepared_media(
+        discord_buffer=compressed,
+        original_data=b"original",
+    )) == b"original"
+    assert MediaPipeline._web_image_data(prepared_media(
+        discord_buffer=compressed,
+        original_data=b"x" * (1024 * 1024 + 1),
+    )) == b"compressed"

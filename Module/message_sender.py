@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from io import BytesIO
 
 import discord
 from PIL import Image
@@ -10,6 +11,8 @@ from telegram.request import HTTPXRequest
 
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome
 from Module.embeds import make_image_embed
+from Module.image_handler import ImageHandler
+from Module.media_pipeline import PreparedMedia
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,12 @@ DISCORD_EMBED_COLOR = 0xFF5733
 
 
 class MessageSender:
-    def __init__(self, telegram_bot_token: object, telegram_chat_id: object, image_handler: object=None) -> None:
+    def __init__(
+        self,
+        telegram_bot_token: str | None,
+        telegram_chat_id: str | None,
+        image_handler: ImageHandler | None = None,
+    ) -> None:
         # 타임아웃 설정 증가 (기본 5초 -> 30초)
         request = HTTPXRequest(
             connect_timeout=30.0,
@@ -29,7 +37,7 @@ class MessageSender:
         # 413(파일 크기 초과) 시 재압축 폴백에 사용 (없으면 폴백 비활성화)
         self.image_handler = image_handler
 
-    def validate_image_buffer(self, image_buffer: object) -> object:
+    def validate_image_buffer(self, image_buffer: BytesIO) -> bool:
         """메모리 버퍼의 이미지 유효성 검증"""
         try:
             image_buffer.seek(0, 2)
@@ -58,7 +66,12 @@ class MessageSender:
             logger.error(f"이미지 검증 실패: {e}")
             return False
 
-    def recompress_for_discord(self, channel: object, image_buffer: object, filename: object) -> object:
+    def recompress_for_discord(
+        self,
+        channel: discord.abc.Messageable,
+        image_buffer: BytesIO,
+        filename: str,
+    ) -> BytesIO | None:
         """Re-compress image after 413 response using guild's actual limit."""
         image_buffer.seek(0)
         data = image_buffer.read()
@@ -108,9 +121,9 @@ class MessageSender:
 
     async def _send_discord_file(
         self,
-        channel: object,
-        image_buffer: object,
-        filename: object,
+        channel: discord.abc.Messageable,
+        image_buffer: BytesIO,
+        filename: str,
         embed: discord.Embed,
         *,
         validated: bool = False,
@@ -151,9 +164,9 @@ class MessageSender:
 
     async def _send_recompressed_discord_file(
         self,
-        channel: object,
-        image_buffer: object,
-        filename: object,
+        channel: discord.abc.Messageable,
+        image_buffer: BytesIO,
+        filename: str,
         embed: discord.Embed,
     ) -> bool:
         if self.image_handler is None:
@@ -188,8 +201,8 @@ class MessageSender:
 
     async def send_discord_payload(
         self,
-        channel: object,
-        items: list[dict[str, object]],
+        channel: discord.abc.Messageable,
+        items: list[PreparedMedia],
         *,
         files: list[discord.File],
         embeds: list[discord.Embed],
@@ -206,8 +219,8 @@ class MessageSender:
             return self._discord_delivery(destination_id, requested_media, ())
 
         for item in items:
-            image_buffer = item["discord_buffer"]
-            if not item.get("validated", False) and not await asyncio.to_thread(
+            image_buffer = item.discord_buffer
+            if not item.validated and not await asyncio.to_thread(
                 self.validate_image_buffer, image_buffer
             ):
                 logger.error("Discord 배치 전송 취소: 이미지 검증 실패")
@@ -228,7 +241,7 @@ class MessageSender:
         finally:
             for item in items:
                 try:
-                    item["discord_buffer"].seek(0)
+                    item.discord_buffer.seek(0)
                 except (OSError, ValueError):
                     pass
 
@@ -237,15 +250,15 @@ class MessageSender:
             if len(items) == 1:
                 sent = await self._send_recompressed_discord_file(
                     channel,
-                    item["discord_buffer"],
-                    item["filename"],
+                    item.discord_buffer,
+                    item.filename,
                     embed,
                 )
             else:
                 sent = await self._send_discord_file(
                     channel,
-                    item["discord_buffer"],
-                    item["filename"],
+                    item.discord_buffer,
+                    item.filename,
                     embed,
                     validated=True,
                 )
@@ -260,7 +273,17 @@ class MessageSender:
             tuple(delivered_media),
         )
 
-    async def send_to_discord(self, channel: object, title: object, image_buffer: object, filename: object, url: object=None, *, validated: bool=False, footer: object=None) -> object:
+    async def send_to_discord(
+        self,
+        channel: discord.abc.Messageable,
+        title: str | None,
+        image_buffer: BytesIO,
+        filename: str,
+        url: str | None = None,
+        *,
+        validated: bool = False,
+        footer: str | None = None,
+    ) -> bool:
         """디스코드로 이미지 전송 (413 시 재압축 후 1회 재시도)
 
         url이 주어지면 임베드 제목이 해당 게시글로 가는 하이퍼링크가 된다.
@@ -275,7 +298,15 @@ class MessageSender:
             validated=validated,
         )
 
-    async def send_to_telegram(self, image_buffer: object, filename: object=None, is_gif: object=False, max_retries: object=3, *, validated: bool=False) -> object:
+    async def send_to_telegram(
+        self,
+        image_buffer: BytesIO,
+        filename: str | None = None,
+        is_gif: bool = False,
+        max_retries: int = 3,
+        *,
+        validated: bool = False,
+    ) -> bool:
         """텔레그램으로 이미지 전송 (GIF는 animation으로, 재시도 포함)"""
         if self.telegram_bot is None:
             logger.debug("Telegram 봇이 설정되지 않음 — 전송 건너뜀")
