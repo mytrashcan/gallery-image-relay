@@ -181,28 +181,36 @@ def test_collect_skips_non_namu() -> None:
     assert _collect('<img src="//cdn.other.com/x.png">') == []
 
 
-def test_collect_new_cdn_original_url() -> None:
+def test_collect_new_cdn_original_url_with_thumbnail_fallback() -> None:
     # Arca.live CDN 마이그레이션 이후: data-originalurl이 ac-o.arca.live (원본 호스트)
+    # 원본(ac-o, Cogent)이 한국 망에서 도달 불가일 때를 대비해
+    # ac.arca.live(썸네일) 폴백이 primary 바로 뒤에 포함돼야 한다 (2026-08-20).
     images = _collect(
         '<img src="//ac.arca.live/thumb/x.webp" data-originalurl="https://ac-o.arca.live/orig/x.png?type=orig">'
     )
     assert len(images) == 1
     assert images[0].primary_url == "https://ac-o.arca.live/orig/x.png?type=orig"
-    # 썸네일(ac.arca.live)은 403이라 fallback으로도 포함되지 않아야 한다
+    assert images[0].fallback_urls == (
+        "https://ac.arca.live/orig/x.png",
+        "https://ac.arca.live/thumb/x.webp",
+    )
+
+
+def test_collect_includes_thumbnail_host() -> None:
+    # data-originalurl 없이 ac.arca.live 썸네일만 있는 img도 이제 추출 대상.
+    # (썸네일 호스트가 200으로 서빙해 원본 CDN 도달 불가 시 폴백 경로로 쓴다)
+    images = _collect('<img src="//ac.arca.live/2026/thumb.webp">')
+    assert len(images) == 1
+    assert images[0].primary_url == "https://ac.arca.live/2026/thumb.webp"
     assert images[0].fallback_urls == ()
-
-
-def test_collect_skips_new_thumbnail_host() -> None:
-    # data-originalurl 없이 ac.arca.live 썸네일만 있는 img는 추출 제외 (403 호스트)
-    assert _collect('<img src="//ac.arca.live/2026/thumb.webp">') == []
 
 
 def test_image_url_validation_accepts_supported_hosts_only() -> None:
     assert _is_allowed_image_url("https://ac-p1.namu.la/x.png") is True
     assert _is_allowed_image_url("https://ac-o.namu.la/x.png") is True
     assert _is_allowed_image_url("https://ac-o.arca.live/x.png") is True
+    assert _is_allowed_image_url("https://ac.arca.live/x.png") is True
     assert _is_allowed_image_url("https://arca.live/x.png") is True
-    assert _is_allowed_image_url("https://ac.arca.live/x.png") is False
     assert _is_allowed_image_url("http://ac-p1.namu.la/x.png") is False
     assert _is_allowed_image_url("https://ac-p1.namu.la:444/x.png") is False
 

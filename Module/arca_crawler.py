@@ -76,7 +76,8 @@ def _is_allowed_image_url(url: str) -> bool:
     except ValueError:
         return False
     # Arca.live는 2026-07-31 이미지 CDN을 *.namu.la에서 ac-o.arca.live(원본)로 이전.
-    # ac.arca.live(썸네일)는 403으로 직접 다운로드 불가라 allowlist 제외.
+    # ac.arca.live(썸네일, Cloudflare)는 원본(ac-o, Cogent)이 한국 망에서
+    # 도달 불가일 때의 폴백으로 사용한다 (2026-08-20 실증: 200으로 서빙).
     return (
         candidate.scheme == "https"
         and not candidate.username
@@ -85,7 +86,7 @@ def _is_allowed_image_url(url: str) -> bool:
         and (
             hostname == "arca.live"
             or hostname.endswith(".namu.la")
-            or hostname == "ac-o.arca.live"
+            or hostname in {"ac-o.arca.live", "ac.arca.live"}
         )
     )
 
@@ -98,9 +99,28 @@ def _original_image_variant(url: str) -> str:
     if re.fullmatch(r"ac-p\d*\.namu\.la", hostname):
         netloc = "ac-o.namu.la"
     query = parts.query
-    if not re.search(r"(?:^|&)type=orig(?:&|$)", query):
+    # ac.arca.live(썸네일)에 type=orig를 붙이면 ac-o.arca.live(원본)로
+    # redirect되어 다운로드할 수 없으므로 썸네일 URL 그대로 유지한다.
+    if hostname != "ac.arca.live" and not re.search(
+        r"(?:^|&)type=orig(?:&|$)", query
+    ):
         query = f"type=orig&{query}" if query else "type=orig"
     return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+
+
+def _thumbnail_variant(url: str) -> str:
+    """Rewrite an ac-o.arca.live (origin) URL onto the thumbnail CDN host.
+
+    ac.arca.live는 같은 경로를 리사이즈본으로 서빙한다. 이미지에 이미 type=orig가
+    포함돼 있으면 제거해야 썸네일 호스트가 다시 원본(ac-o)으로 redirect하지 않는다.
+    """
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() != "ac-o.arca.live":
+        return url
+    query = "&".join(
+        p for p in parts.query.split("&") if p and not p.startswith("type=")
+    )
+    return urlunsplit((parts.scheme, "ac.arca.live", parts.path, query, ""))
 
 
 def _extension_variant(url: str, extension: str) -> str:
@@ -137,7 +157,22 @@ def _ordered_media_urls(img_tag) -> tuple[str, ...]:
         for variant in (*variants, resolved):
             if variant not in urls and _is_allowed_image_url(variant):
                 urls.append(variant)
-    return tuple(urls)
+
+    # 원본 CDN(ac-o.arca.live)이 도달 불가한 동안은 썸네일(ac.arca.live)로 폴백.
+    # 다운로드 시도 예산(max_attempts) 안에서 즉시 닿도록 primary 바로 뒤에 둔다.
+    ordered: list[str] = []
+    for index, url in enumerate(urls):
+        ordered.append(url)
+        if index == 0:
+            thumb = _thumbnail_variant(url)
+            if (
+                thumb != url
+                and thumb not in ordered
+                and thumb not in urls
+                and _is_allowed_image_url(thumb)
+            ):
+                ordered.append(thumb)
+    return tuple(ordered)
 
 
 def _create_session():
