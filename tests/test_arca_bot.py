@@ -12,7 +12,7 @@ import discord
 import pytest
 from PIL import Image
 
-from Module.arca_bot import ArcaBot, MediaPreparation
+from Module.arca_bot import ArcaBot, MediaPreparation, _make_download_client
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
 from Module.media_candidate import MediaCandidate
 from Module.media_download import MediaDownloadTooLarge
@@ -502,3 +502,27 @@ async def test_only_media_from_successful_arca_batch_are_hash_marked(
     bot.image_handler.mark_hash_sent.assert_any_call("h1")
     bot.image_handler.mark_hash_sent.assert_any_call("h2")
     assert bot.image_handler.mark_hash_sent.call_count == 2
+
+
+# ---------- 다운로드 프록시 클라이언트 ----------
+
+
+def test_download_client_returns_requests_module_without_proxy(monkeypatch):
+    import requests as _requests
+
+    monkeypatch.setattr("Module.arca_bot.app_config.arca_socks_proxy", "")
+    assert _make_download_client() is _requests
+
+
+def test_download_client_applies_socks_proxy(monkeypatch):
+    import requests as _requests
+
+    monkeypatch.setattr(
+        "Module.arca_bot.app_config.arca_socks_proxy",
+        "socks5h://127.0.0.1:1080",
+    )
+
+    client = _make_download_client()
+    assert isinstance(client, _requests.Session)
+    assert client.proxies.get("https") == "socks5h://127.0.0.1:1080"
+    assert client.proxies.get("http") == "socks5h://127.0.0.1:1080"
