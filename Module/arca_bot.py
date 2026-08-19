@@ -45,6 +45,25 @@ INTER_IMAGE_DELAY = 1.0
 IMAGE_DOWNLOAD_DELAY = 0.5
 
 
+def _make_download_client() -> object:
+    """Arca 이미지 다운로드용 requests 클라이언트를 돌려준다.
+
+    페이지 크롤링(_create_session)과 동일하게 SOCKS 프록시를 적용한다.
+    서버의 직접 IP는 아카 Cloudflare에서 403으로 차단되지만, 프록시
+    egress(가정망)로는 ac.arca.live(썸네일)가 200으로 서빙된다
+    (2026-08-20 실증: plain requests + ARCA_SOCKS_PROXY → 200 image/jpeg).
+
+    프록시가 미설정이면 전역 requests 모듈을 그대로 쓴다 (동작 불변,
+    기존 테스트 호환).
+    """
+    proxy = getattr(app_config, "arca_socks_proxy", "")
+    if not proxy:
+        return requests
+    session = requests.Session()
+    session.proxies.update({"http": proxy, "https": proxy})
+    return session
+
+
 @dataclass(frozen=True, slots=True)
 class MediaPreparation:
     item: PreparedMedia | None
@@ -280,7 +299,7 @@ class ArcaBot(discord.Client):
             candidate = replace(candidate, headers={"Referer": referer})
         try:
             return download_media_candidate(
-                requests,
+                _make_download_client(),
                 candidate,
                 is_allowed_url=_is_allowed_image_url,
                 validate=self.image_handler.validate_image_data,
