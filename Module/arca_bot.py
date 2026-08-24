@@ -202,10 +202,13 @@ class ArcaBot(discord.Client):
                 if delivery.transport == "discord"
                 for media_id in delivery.delivered_media
             }
-            # 성공 확정된 media만 hash 표시 (PARTIAL fallback 시 실패 항목은 재시도 대상 유지)
+            # 성공 확정된 media만 hash 확정 (PARTIAL fallback 시 실패 항목은
+            # 예약을 해제해 재시도 대상으로 유지)
             for item in batch:
                 if item.content_hash in delivered_media:
                     self.image_handler.mark_hash_sent(item.content_hash)
+                else:
+                    self.image_handler.release_hash(item.content_hash)
             delivery_result = delivery_result.merge(batch_result)
         return delivery_result.acknowledged and all_resolved
 
@@ -248,15 +251,18 @@ class ArcaBot(discord.Client):
                 if verified is None:
                     return MediaPreparation(None, False)
 
+                # process_image(압축 등 CPU 작업) 전에 해시를 선점한다. 전송 성공
+                # 시 mark_hash_sent로 확정되고, 실패 시 release_hash로 롤백되므로
+                # 동일 이미지가 여러 게시글에서 동시에 유입돼도 이중 전송되지 않는다.
+                if not self.image_handler.reserve_hash(verified.content_hash):
+                    logger.info(f"[아카라이브] 중복 이미지 스킵: {verified.filename}")
+                    return MediaPreparation(None, True)
+
                 discord_buffer, telegram_buffer, is_gif = await asyncio.to_thread(
                     self.image_handler.process_image,
                     verified.data,
                     verified.filename,
                 )
-
-                if self.image_handler.has_seen_hash(verified.content_hash):
-                    logger.info(f"[아카라이브] 중복 이미지 스킵: {verified.filename}")
-                    return MediaPreparation(None, True)
 
                 return MediaPreparation(
                     PreparedMedia(

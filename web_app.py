@@ -74,8 +74,22 @@ _FEED_RATE_MAX = 120
 
 
 def _client_ip(request: Request) -> str:
-    """Cloudflare 경유 시 실제 클라이언트 IP, 아니면 소켓 상의 IP."""
-    return request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
+    """Cloudflare 경유 시 실제 클라이언트 IP, 아니면 소켓 상의 IP.
+
+    cf-connecting-ip 헤더는 클라이언트가 위조할 수 있으므로, WEB_ORIGIN_SECRET이
+    설정돼 있으면 같은 값의 x-origin-secret 헤더가 동반될 때만 신뢰한다(미설정 시
+    기존 동작 유지). 오리진 포트가 외부에 직접 노출돼도 헤더 위조로 rate limit·
+    Turnstile 우회를 할 수 없게 하는 최소 방어선.
+    """
+    ip = request.headers.get("cf-connecting-ip")
+    if ip is not None:
+        secret = app_config.web_origin_secret
+        supplied = request.headers.get("x-origin-secret", "")
+        if not secret or hmac.compare_digest(
+            secret.encode(), supplied.encode("latin-1", "backslashreplace")
+        ):
+            return ip
+    return request.client.host if request.client else "unknown"
 
 
 def _rate_limited(bucket: dict, ip: str, window: float, max_count: int) -> bool:
@@ -131,13 +145,19 @@ async def _read_verify_body(request: Request) -> bytes | None:
     return bytes(data)
 
 
-def _ts_make_cookie() -> str:
+def _ts_make_cookie(ip: str) -> str:
+    """쿠키 서명을 발급 클라이언트 IP에 바인딩한다.
+
+    만료시각만 서명하면 쿠키를 다른 클라이언트에 복사해 Turnstile을 대량 우회할 수
+    있으므로, 서명 대상에 IP를 포함해 쿠키 이동(share)을 무효화한다.
+    """
     exp = int(time.time()) + _TS_TTL
-    sig = hmac.new(_ts_secret().encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+    payload = f"{exp}.{ip}"
+    sig = hmac.new(_ts_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{exp}.{sig}"
 
 
-def _ts_cookie_valid(value: str) -> bool:
+def _ts_cookie_valid(value: str, ip: str) -> bool:
     if not value or "." not in value:
         return False
     exp_s, sig = value.split(".", 1)
@@ -147,7 +167,8 @@ def _ts_cookie_valid(value: str) -> bool:
         return False
     if time.time() > exp:
         return False
-    good = hmac.new(_ts_secret().encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+    payload = f"{exp}.{ip}"
+    good = hmac.new(_ts_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, good)
 
 
@@ -371,14 +392,15 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
 
     @app.get("/feed")
     async def feed(request: Request, limit: int = Query(60, ge=1, le=200)) -> Response:
-        if _rate_limited(_feed_ip_rate, _client_ip(request), _FEED_RATE_WINDOW, _FEED_RATE_MAX):
+        ip = _client_ip(request)
+        if _rate_limited(_feed_ip_rate, ip, _FEED_RATE_WINDOW, _FEED_RATE_MAX):
             return JSONResponse({"error": "too many requests"}, status_code=429)
         if _maintenance_on() and request.headers.get("cf-connecting-ip"):
             return JSONResponse({"error": "maintenance"}, status_code=503)
         # Cloudflare를 거친 공개 요청(cf-connecting-ip 존재)만 Turnstile 통과를 요구한다.
         # 로컬 직접 접근(대시보드 등)은 헤더가 없어 그대로 허용.
         if _ts_enabled() and request.headers.get("cf-connecting-ip"):
-            if not _ts_cookie_valid(request.cookies.get(_TS_COOKIE, "")):
+            if not _ts_cookie_valid(request.cookies.get(_TS_COOKIE, ""), ip):
                 return JSONResponse({"error": "verification required"}, status_code=403)
         return JSONResponse(gallery_store.snapshot(limit))
 
@@ -401,7 +423,7 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         if not ok:
             return JSONResponse({"ok": False}, status_code=403)
         resp = JSONResponse({"ok": True})
-        resp.set_cookie(_TS_COOKIE, _ts_make_cookie(), max_age=_TS_TTL,
+        resp.set_cookie(_TS_COOKIE, _ts_make_cookie(_client_ip(request)), max_age=_TS_TTL,
                         httponly=True, samesite="lax", secure=True)
         return resp
 

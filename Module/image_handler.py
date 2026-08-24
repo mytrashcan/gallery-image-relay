@@ -4,6 +4,7 @@ import io
 import logging
 import math
 import os
+import threading
 from math import ceil
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -41,6 +42,10 @@ class ImageHandler:
         delivery_archive: DeliveryArchive | None = None,
     ) -> None:
         self._seen_hashes = LRUCache(MAX_HASH_CACHE_SIZE)
+        # 전송 성공 확정 전 해시 예약 집합: 다운로드 시점에 선점해 동일 이미지가
+        # 여러 게시글에서 동시에 유입돼도 이중 전송되지 않게 한다(전송 실패 시 해제).
+        self._hash_lock = threading.Lock()
+        self._pending_hashes: set[str] = set()
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.source = source
@@ -52,6 +57,10 @@ class ImageHandler:
             )
 
     def has_seen_hash(self, content_hash: str) -> bool:
+        with self._hash_lock:
+            return self._has_seen_hash_locked(content_hash)
+
+    def _has_seen_hash_locked(self, content_hash: str) -> bool:
         if content_hash in self._seen_hashes:
             return True
         if self.delivery_archive is None:
@@ -65,18 +74,42 @@ class ImageHandler:
         self._seen_hashes.add(content_hash)
         return True
 
+    def reserve_hash(self, content_hash: str) -> bool:
+        """중복 전송 방지를 위해 해시를 선점한다.
+
+        이미 기록된(또는 다른 스레드가 선점 중인) 해시면 False를 반환하고,
+        처음 보는 해시면 예약하고 True를 반환한다. 예약은 전송 성공 시
+        mark_hash_sent로 확정되고, 실패 시 release_hash로 롤백된다.
+        """
+        with self._hash_lock:
+            if self._has_seen_hash_locked(content_hash):
+                return False
+            if content_hash in self._pending_hashes:
+                return False
+            self._pending_hashes.add(content_hash)
+            return True
+
+    def release_hash(self, content_hash: str) -> None:
+        """reserve_hash로 선점한 해시를 전송 실패 시 되돌려 재시도 가능하게 한다."""
+        with self._hash_lock:
+            self._pending_hashes.discard(content_hash)
+
     def mark_hash_sent(self, content_hash: str) -> None:
-        if self.delivery_archive is not None:
-            self.delivery_archive.add(
-                self.source,
-                self.gallery_name,
-                image_key(content_hash),
-            )
-        self._seen_hashes.add(content_hash)
+        with self._hash_lock:
+            self._pending_hashes.discard(content_hash)
+            if self.delivery_archive is not None:
+                self.delivery_archive.add(
+                    self.source,
+                    self.gallery_name,
+                    image_key(content_hash),
+                )
+            self._seen_hashes.add(content_hash)
 
     def clear_seen_hashes(self) -> object:
         """중복 체크용 해시 캐시 초기화"""
-        self._seen_hashes.clear()
+        with self._hash_lock:
+            self._seen_hashes.clear()
+            self._pending_hashes.clear()
         logger.info("이미지 해시 캐시가 초기화되었습니다.")
 
     def compress_gif(self, image_data: object, target_size: object, filename: object) -> object:
