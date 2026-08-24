@@ -342,6 +342,41 @@ def test_verify_accepts_valid_string_token(monkeypatch, tmp_path):
     siteverify.assert_called_once_with("turnstile-token", "203.0.113.8")
 
 
+def test_turnstile_cookie_is_bound_to_client_ip(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "turnstile_secret", "test-secret")
+
+    cookie = web_app._ts_make_cookie("203.0.113.8")
+    assert web_app._ts_cookie_valid(cookie, "203.0.113.8") is True
+    # Same cookie replayed from a different IP must be rejected.
+    assert web_app._ts_cookie_valid(cookie, "198.51.100.1") is False
+
+
+def test_client_ip_trusted_without_origin_secret(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app.app_config, "web_origin_secret", "")
+
+    class _Req:
+        headers = {"cf-connecting-ip": "203.0.113.9"}
+        client = None
+
+    assert web_app._client_ip(_Req())  # type: ignore[arg-type] == "203.0.113.9"
+
+
+def test_client_ip_requires_origin_secret_when_configured(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_app.app_config, "web_origin_secret", "origin-secret")
+    monkeypatch.setattr(web_app.app_config, "web_static_dir", str(tmp_path / "ws"))
+
+    class _Req:
+        def __init__(self, extra=None):
+            self.headers = {"cf-connecting-ip": "203.0.113.9", **(extra or {})}
+            self.client = type("C", (), {"host": "10.0.0.5"})()
+
+    # Spoofed header without the secret falls back to the socket peer.
+    assert web_app._client_ip(_Req())  # type: ignore[arg-type] == "10.0.0.5"
+    assert web_app._client_ip(_Req({"x-origin-secret": "wrong"}))  # type: ignore[arg-type] == "10.0.0.5"
+    assert web_app._client_ip(_Req({"x-origin-secret": "origin-secret"}))  # type: ignore[arg-type] == "203.0.113.9"
+
+
 def test_static_pages_do_not_include_ad_network_hooks():
     static_dir = Path(web_app.__file__).parent / "web_static"
     rejected_markers = (

@@ -319,6 +319,7 @@ Notes for small instances (1 GB RAM free tier):
 | `MEDIA_DOWNLOAD_MAX_MB` | env | 15 | Hard streaming limit for each source image download |
 | `MEDIA_MAX_PIXELS` | env | 24000000 | Pixel-count limit checked before image processing |
 | `TURNSTILE_SITEKEY` / `TURNSTILE_SECRET` | `.env` (never commit) | unset | Cloudflare Turnstile bot gate for the web gallery; unset disables it entirely |
+| `WEB_ORIGIN_SECRET` | `.env` (never commit) | unset | When set, a request carrying `cf-connecting-ip` must also carry the matching `x-origin-secret` header or the header is ignored (socket peer IP used instead). Set the same value in a Cloudflare Transform Rule that injects `x-origin-secret`. For stronger protection, also enable Cloudflare Authenticated Origin Pulls (mTLS) on the zone; unset keeps legacy behavior |
 
 ## Development
 

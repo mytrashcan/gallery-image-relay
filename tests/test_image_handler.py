@@ -45,6 +45,25 @@ class TestHashCache:
         handler.clear_seen_hashes()
         assert handler.has_seen_hash("abc") is False
 
+    def test_reserve_hash_prevents_double_reservation(self) -> None:
+        handler = ImageHandler()
+        assert handler.reserve_hash("abc") is True
+        assert handler.reserve_hash("abc") is False
+        assert handler.has_seen_hash("abc") is False  # not confirmed yet
+
+    def test_release_hash_rolls_back_reservation(self) -> None:
+        handler = ImageHandler()
+        handler.reserve_hash("abc")
+        handler.release_hash("abc")
+        assert handler.reserve_hash("abc") is True
+
+    def test_mark_hash_sent_confirms_reservation(self) -> None:
+        handler = ImageHandler()
+        handler.reserve_hash("abc")
+        handler.mark_hash_sent("abc")
+        assert handler.has_seen_hash("abc") is True
+        assert "abc" not in handler._pending_hashes
+
     def test_archive_prevents_redelivery_after_restart(self, tmp_path) -> None:
         archive_path = tmp_path / "delivery.sqlite3"
 

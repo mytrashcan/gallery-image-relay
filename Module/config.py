@@ -54,6 +54,12 @@ class AppConfig:
     turnstile_sitekey: str = ""
     turnstile_secret: str = ""
 
+    # Shared secret between Cloudflare (or another reverse proxy) and this origin.
+    # When set, a request carrying cf-connecting-ip must also carry the matching
+    # x-origin-secret header, otherwise the header is ignored and the socket peer
+    # address is used instead (defends against direct-to-origin header spoofing).
+    web_origin_secret: str = ""
+
     # Arca (SOCKS proxy for arcalive crawler)
     arca_socks_proxy: str = ""
     arca_download_concurrency: int = 2
@@ -102,6 +108,7 @@ class AppConfig:
             web_gallery=os.getenv("WEB_GALLERY") == "1",
             turnstile_sitekey=os.getenv("TURNSTILE_SITEKEY", ""),
             turnstile_secret=os.getenv("TURNSTILE_SECRET", ""),
+            web_origin_secret=os.getenv("WEB_ORIGIN_SECRET", ""),
             arca_socks_proxy=os.getenv("ARCA_SOCKS_PROXY", ""),
             arca_download_concurrency=int(os.getenv("ARCA_DOWNLOAD_CONCURRENCY", "2")),
             media_download_max_mb=int(os.getenv("MEDIA_DOWNLOAD_MAX_MB", "15")),
