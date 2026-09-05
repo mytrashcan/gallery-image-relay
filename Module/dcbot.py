@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from pathlib import Path
 
 import discord
 
@@ -10,6 +11,7 @@ from Module.config import app_config
 from Module.crawler import DCInsideCrawler, DCPost
 from Module.delivery_archive import DeliveryArchive
 from Module.image_handler import ImageHandler
+from Module.lifecycle import run_blocking
 from Module.media_pipeline import MediaPipeline, PreparedMedia
 from Module.message_sender import MessageSender
 from Module.process_leader import ProcessLeaderLock
@@ -58,6 +60,9 @@ class DCBot(discord.Client):
             web_gallery_enabled=app_config.web_gallery,
             web_gallery_name=self.gallery_name,
             source_label="디시인사이드",
+            delivery_archive=self.delivery_archive,
+            source="dcinside",
+            gallery_name=self.gallery_name,
         )
         self._crawler_task: asyncio.Task | None = None
         self._command_leader = ProcessLeaderLock()
@@ -78,6 +83,9 @@ class DCBot(discord.Client):
             self._crawler_task.cancel()
             await asyncio.gather(self._crawler_task, return_exceptions=True)
         await self.media_pipeline.close()
+        await self.message_sender.close()
+        self.crawler.session.close()
+        self.image_handler.session.close()
         self._command_leader.close()
         if self.delivery_archive is not None:
             self.delivery_archive.close()
@@ -86,21 +94,22 @@ class DCBot(discord.Client):
     async def start_crawling(self) -> None:
         while True:
             try:
-                post = await asyncio.to_thread(self.crawler.get_latest_post)
+                post = await run_blocking(self.crawler.get_latest_post)
                 if post:
+                    logger.info("post selected source=dcinside gallery=%s post_id=%s", self.gallery_name, post["post_id"])
                     if not post['has_image'] or await self.process_post(post):
                         self.crawler.mark_sent(post["post_id"])
             except discord.ConnectionClosed:
                 logger.warning("Discord 연결이 끊어졌습니다. 재연결 대기 중...")
                 await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"크롤링 중 오류: {e}", exc_info=True)
+                logger.error("crawl failed source=dcinside gallery=%s error=%s", self.gallery_name, type(e).__name__)
             delay = random.uniform(20, 40)
             await asyncio.sleep(delay)
 
     async def process_post(self, post: DCPost) -> bool:
         # blocking I/O를 별도 스레드에서 실행
-        images = await asyncio.to_thread(self.image_handler.download_images, post['link'])
+        images = await run_blocking(self.image_handler.download_images, post['link'])
         if images is None:
             return False
         if not images:
@@ -125,8 +134,8 @@ class DCBot(discord.Client):
             link=post['link'],
             inter_image_delay=1.0,
         )
-        if delivery_result.acknowledged:
-            for item in media_items:
+        for item in media_items:
+            if delivery_result.media_acknowledged(item.content_hash):
                 self.image_handler.mark_hash_sent(item.content_hash)
         return delivery_result.acknowledged
 
@@ -140,7 +149,7 @@ class DCBot(discord.Client):
             if not self._command_leader.try_acquire():
                 return
 
-            file = discord.File("gaki.png", filename="gaki.png")
+            file = discord.File(str(Path(__file__).resolve().parent.parent / "gaki.png"), filename="gaki.png")
             embed = discord.Embed(
                 title="이미지 캐시를 초기화했습니다!",
                 description="이제 새로운 이미지들을 받을 준비 완료!",

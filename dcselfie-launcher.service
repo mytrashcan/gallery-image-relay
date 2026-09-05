@@ -1,6 +1,6 @@
 [Unit]
 Description=dcselfie image crawler launcher (DCInside + Arcalive)
-Requires=dcselfie-web.service
+Wants=dcselfie-web.service
 After=network.target network-online.target dcselfie-web.service
 Wants=network-online.target
 
@@ -17,9 +17,13 @@ ExecStart=/home/ubuntu/dcinsideImageCrawler/venv/bin/python3 launcher.py
 Restart=always
 RestartSec=30
 LimitCORE=0
+MemorySwapMax=0
+MemoryMax=4G
 UMask=0077
-StandardOutput=append:/home/ubuntu/dcinsideImageCrawler/logs/launcher.log
-StandardError=append:/home/ubuntu/dcinsideImageCrawler/logs/launcher.log
+TimeoutStopSec=110
+KillMode=mixed
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

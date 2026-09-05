@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
+import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,11 +196,11 @@ class HoneypotRecorder:
 
     def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
         configured_path = path or os.environ.get("HONEYPOT_LOG_PATH")
-        self.path = (
-            Path(configured_path)
-            if configured_path
-            else Path(__file__).resolve().parent / "honeypot_traffic.jsonl"
-        )
+        self.path = Path(configured_path) if configured_path else None
+        self.events = deque(maxlen=1000)
+        self.max_log_bytes = 4 * 1024 * 1024
+        self._window = time.monotonic()
+        self._count = 0
         self._lock = threading.Lock()
 
     def record(
@@ -216,22 +219,35 @@ class HoneypotRecorder:
         event = {
             "timestamp": datetime.now(UTC).isoformat(),
             "event_id": uuid.uuid4().hex,
-            "source_ip": source_ip,
-            "user_agent": user_agent,
+            "source_ip": source_ip[:64],
+            "user_agent": user_agent[:256],
             "method": method,
-            "path": path,
-            "query_keys": sorted(set(query_keys)),
+            "path": path[:256],
+            "query_keys": sorted({key[:64] for key in query_keys[:32]}),
             "category": category,
-            "matched_signature": matched_signature,
+            "matched_signature": matched_signature[:256],
             "status_code": status_code,
             "response_shape": response_shape,
         }
         encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as log_file:
-                log_file.write(encoded)
-                log_file.write("\n")
+            now = time.monotonic()
+            if now - self._window >= 60:
+                self._count, self._window = 0, now
+            if self._count >= 100:
+                return event
+            self._count += 1
+            self.events.append(event)
+            if self.path is not None:
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    if self.path.exists() and self.path.stat().st_size + len(encoded.encode()) + 1 > self.max_log_bytes:
+                        self.path.replace(self.path.with_name(self.path.name + ".1"))
+                    with self.path.open("a", encoding="utf-8") as log_file:
+                        log_file.write(encoded + "\n")
+                except OSError:
+                    # Optional diagnostics must not take down public routes.
+                    pass
         return event
 
 
@@ -427,6 +443,8 @@ def _response_shape(path: str, status_code: int) -> str:
 def install_trap(app: FastAPI, recorder: HoneypotRecorder) -> None:
     """Register the trap after all real application routes."""
 
+    slots = asyncio.Semaphore(2)
+
     @app.api_route(
         "/{full_path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
@@ -445,7 +463,11 @@ def install_trap(app: FastAPI, recorder: HoneypotRecorder) -> None:
             return JSONResponse({"detail": "Not Found"}, status_code=404)
 
         status_code, body, content_type = decoy_responses(path, request.method)
-        recorder.record(
+        from Module.lifecycle import run_blocking
+        if slots.locked():
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        async with slots:
+            await run_blocking(recorder.record,
             source_ip=request.headers.get("cf-connecting-ip")
             or (request.client.host if request.client else "unknown"),
             user_agent=request.headers.get("user-agent", ""),

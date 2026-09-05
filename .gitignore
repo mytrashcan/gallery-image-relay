@@ -198,3 +198,6 @@ logs/
 *.p12
 *.pfx
 img.key
+
+# Local deployment staging and rollback environments
+.deploy/

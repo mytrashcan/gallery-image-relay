@@ -33,6 +33,8 @@ def make_crawler(html: object) -> object:
     crawler = DCInsideCrawler("https://gall.dcinside.com/mgallery/board/lists/?id=test")
     response = MagicMock()
     response.text = html
+    response.headers = {}
+    response.iter_content.return_value = [html.encode()]
     response.raise_for_status = MagicMock()
     crawler.session = MagicMock()
     crawler.session.get.return_value = response
@@ -132,6 +134,8 @@ class TestGetLatestPost:
             )
             response = MagicMock()
             response.text = html
+            response.headers = {}
+            response.iter_content.return_value = [html.encode()]
             response.raise_for_status = MagicMock()
             restarted.session = MagicMock()
             restarted.session.get.return_value = response

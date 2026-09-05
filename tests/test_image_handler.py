@@ -171,6 +171,8 @@ class TestDownloadImages:
     def make_handler(self, html: str, image_data: bytes) -> ImageHandler:
         handler = ImageHandler()
         page_response = MagicMock(text=html)
+        page_response.headers = {}
+        page_response.iter_content.return_value = [html.encode()]
         image_response = MagicMock(content=image_data)
         image_response.headers = {"content-length": str(len(image_data))}
         image_response.iter_content.return_value = [image_data]
@@ -216,6 +218,8 @@ class TestDownloadImages:
         )
         handler = ImageHandler()
         page_response = MagicMock(text=html)
+        page_response.headers = {}
+        page_response.iter_content.return_value = [html.encode()]
         missing_response = MagicMock()
         missing_response.headers = {}
         missing_response.status_code = 404

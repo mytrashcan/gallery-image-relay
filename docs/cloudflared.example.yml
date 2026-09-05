@@ -1,0 +1,10 @@
+# Local tunnel example; replace placeholders in a private ~/.cloudflared/config.yml.
+tunnel: YOUR-TUNNEL-UUID
+credentials-file: /absolute/private/path/YOUR-TUNNEL-UUID.json
+ingress:
+  - hostname: gallery.example.com
+    path: ^/internal(/.*)?$
+    service: http_status:404
+  - hostname: gallery.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404

@@ -131,6 +131,8 @@ class MemoryGalleryStore:
             self._items[image_id] = item
             self._bytes += item.memory_bytes
             self._recent_hashes[digest] = now
+            while len(self._recent_hashes) > self.max_items * 2:
+                del self._recent_hashes[next(iter(self._recent_hashes))]
             return item.feed_item()
 
     def get(self, image_id: str, *, thumbnail: bool = False) -> tuple[bytes, str] | None:
@@ -208,7 +210,7 @@ class MemoryGalleryStore:
                 return prepared, ext, media_type, width, height, thumbnail, thumb_type
         except ImageTooLarge:
             raise
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
             raise InvalidImage("invalid image data") from exc
 
     def _compress(self, source: Image.Image) -> bytes:
@@ -236,7 +238,7 @@ class MemoryGalleryStore:
         cutoff = now - self.ttl_seconds
         while self._items:
             oldest = next(iter(self._items.values()))
-            if oldest.created_at >= cutoff:
+            if oldest.created_at > cutoff:
                 break
             self._evict_oldest_locked()
         self._recent_hashes = {

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
+
+from Module.lifecycle import run_until_signal
 
 # config는 arca_crawler보다 먼저 import해야 함 (arca_crawler가 app_config로 프록시를 읽음)
 from Module.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TOKEN, get_discord_intents, validate_required_env  # isort: skip
@@ -11,15 +12,11 @@ from Module.arca_bot import ArcaBot
 from Module.dcbot import DCBot
 
 
-def load_gallery_config(gallery_name: object) -> object:
-    with open("galleries.json", encoding="utf-8") as f:
-        galleries = json.load(f)
-
+def load_gallery_config(gallery_name):
+    from Module.config import load_gallery_configs
+    galleries = load_gallery_configs()
     if gallery_name not in galleries:
-        print(f"알 수 없는 갤러리: {gallery_name}")
-        print(f"사용 가능: {', '.join(galleries.keys())}")
-        sys.exit(1)
-
+        raise SystemExit("Unknown gallery name")
     return galleries[gallery_name]
 
 
@@ -61,4 +58,4 @@ if __name__ == "__main__":
         print("  WEB_GALLERY=1 로 웹 갤러리 연동")
         sys.exit(1)
 
-    asyncio.run(main(sys.argv[1]))
+    asyncio.run(run_until_signal(main(sys.argv[1])))
