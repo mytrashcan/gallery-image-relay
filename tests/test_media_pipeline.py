@@ -60,6 +60,7 @@ async def successful_discord_payload(
     embeds,
     destination_id,
     requested_media,
+    on_delivered=None,
 ):
     return discord_delivery(destination_id, requested_media)
 
@@ -88,7 +89,7 @@ def test_delivery_result_merge_is_pure_and_has_no_bool_override() -> None:
     merged = first.merge(second)
 
     assert merged.deliveries == (failed, succeeded)
-    assert merged.acknowledged is True
+    assert merged.acknowledged is False
     assert first.deliveries == (failed,)
     assert first.acknowledged is False
     assert "__bool__" not in DeliveryResult.__dict__
@@ -223,7 +224,7 @@ async def test_any_successful_discord_channel_acknowledges_batch_without_retry()
         link="https://example.com/1",
     )
 
-    assert result.acknowledged is True
+    assert result.acknowledged is False
     assert [delivery.outcome for delivery in result.deliveries] == [
         DeliveryOutcome.FAILED,
         DeliveryOutcome.SUCCEEDED,
@@ -283,7 +284,7 @@ async def test_telegram_success_acknowledges_failed_discord() -> None:
         validated=True,
     )])
 
-    assert result.acknowledged is True
+    assert result.acknowledged is False
     assert [delivery.outcome for delivery in result.deliveries] == [
         DeliveryOutcome.FAILED,
         DeliveryOutcome.SUCCEEDED,
@@ -328,6 +329,7 @@ async def test_discord_payload_is_rebuilt_and_buffers_are_rewound_per_channel() 
         embeds,
         destination_id,
         requested_media,
+        on_delivered=None,
     ):
         observed_payloads.append((
             [discord_file.fp.read() for discord_file in files],

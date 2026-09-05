@@ -30,7 +30,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from Module.config import app_config
+from Module.config import app_config, load_gallery_configs
 
 BASE = app_config.dash_base_url or f"http://{app_config.dash_host}:{app_config.web_port}"
 REMOTE = bool(app_config.dash_base_url)  # 원격(공개 API)이면 크롤러 프로세스는 이 기기에서 안 보임
@@ -48,9 +48,8 @@ ARCA_BLUE = "#00A3FF"
 
 def _configs() -> object:
     try:
-        with open("galleries.json", encoding="utf-8") as f:
-            return json.load(f)
-    except OSError:
+        return load_gallery_configs()
+    except (OSError, ValueError):
         return {}
 
 

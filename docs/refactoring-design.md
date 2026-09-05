@@ -1,3 +1,5 @@
+> Historical design (August 2026). The delivery acknowledgement policy and responsibility table below are superseded by [production hardening](production-hardening.md). Current code requires success at every configured durable destination and persists destination receipts.
+
 # Gallery Image Relay 리팩터링 설계
 
 ## 1. 배경과 목표

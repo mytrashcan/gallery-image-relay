@@ -1,6 +1,8 @@
 # config.py
+import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,11 +10,39 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
-load_dotenv()
+from Module.logging_policy import install_logging_privacy
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Explicit environment wins, root .env next, legacy Module/.env is fallback.
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+load_dotenv(PROJECT_ROOT / "Module" / ".env", override=False)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ARCHIVE_PATH = "var/delivery_archive.sqlite3"
+DEFAULT_ARCHIVE_PATH = str(PROJECT_ROOT / "var" / "delivery_archive.sqlite3")
+
+
+def load_gallery_configs(path: str | Path | None = None) -> dict:
+    from Module.url_policy import source_page
+
+    with Path(path or PROJECT_ROOT / "galleries.json").open(encoding="utf-8") as stream:
+        values = json.load(stream)
+    if not isinstance(values, dict) or not values:
+        raise ValueError("galleries.json must contain a non-empty object")
+    for name, value in values.items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", name) or not isinstance(value, dict):
+            raise ValueError("invalid gallery name or object")
+        if value.get("type", "dc") not in {"dc", "arca"}:
+            raise ValueError(f"{name}: unsupported gallery type")
+        source = "arcalive" if value.get("type") == "arca" else "dcinside"
+        if not source_page(value.get("base_url", ""), source):
+            raise ValueError(f"{name}: invalid source URL")
+        channels = value.get("channel_ids")
+        if not isinstance(channels, list) or not channels or any(
+            not isinstance(c, str) or not c.isascii() or not c.isdigit() or int(c) <= 0 for c in channels
+        ) or len(set(channels)) != len(channels):
+            raise ValueError(f"{name}: channel_ids must be unique positive numeric strings")
+    return values
 
 
 @dataclass
@@ -33,7 +63,7 @@ class AppConfig:
     telegram_chat_id: str = ""
 
     # Web gallery
-    web_static_dir: str = "web_static"
+    web_static_dir: str = str(PROJECT_ROOT / "web_static")
     web_host: str = "127.0.0.1"
     web_port: int = 8000
     web_image_ttl_seconds: int = 10800  # 3 hours
@@ -43,6 +73,7 @@ class AppConfig:
     web_image_max_mb: int = 12
     web_ingest_max_mb: int = 12
     web_upload_queue_size: int = 20
+    web_upload_queue_max_mb: int = 32
     web_freshness_seconds: int = 900
     web_gallery_url: str = "http://127.0.0.1:8000"
     web_ingest_token: str = ""
@@ -67,6 +98,8 @@ class AppConfig:
     # Source media safety limits. Originals within these bounds remain untouched.
     media_download_max_mb: int = 15
     media_max_pixels: int = 24_000_000
+    media_max_frames: int = 200
+    media_max_animation_pixels: int = 60_000_000
 
     # Successful-delivery deduplication metadata (never image bytes).
     archive_path: str = DEFAULT_ARCHIVE_PATH
@@ -75,22 +108,45 @@ class AppConfig:
     dash_host: str = "127.0.0.1"
     dash_base_url: str = ""
 
+    def __post_init__(self) -> None:
+        for name in (
+            "discord_max_size_mb", "web_port", "web_image_ttl_seconds", "web_feed_max_items",
+            "web_memory_max_mb", "web_image_max_mb", "web_ingest_max_mb", "web_upload_queue_size",
+            "web_freshness_seconds", "web_upload_queue_max_mb", "arca_download_concurrency", "media_download_max_mb",
+            "media_max_pixels", "media_max_frames", "media_max_animation_pixels",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name.upper()} must be a positive integer")
+        if self.web_port > 65535 or self.web_thumb_width < 0 or self.arca_download_concurrency > 4:
+            raise ValueError("invalid WEB_PORT, WEB_THUMB_WIDTH or ARCA_DOWNLOAD_CONCURRENCY")
+        from urllib.parse import urlsplit
+        for name, schemes in (("web_gallery_url", {"http", "https"}), ("arca_socks_proxy", {"socks5", "socks5h"})):
+            value = getattr(self, name)
+            if not value:
+                continue
+            try:
+                p = urlsplit(value)
+                valid = p.scheme in schemes and p.hostname and (p.port is None or 0 < p.port <= 65535)
+                if name == "web_gallery_url":
+                    valid = valid and not p.username and not p.password and not p.query and not p.fragment
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError(f"invalid {name.upper()}")
+
     @classmethod
     def from_env(cls) -> "AppConfig":
         """Build an AppConfig instance by reading all environment variables."""
         # DISCORD_MAX_SIZE_MB with safe fallback
-        try:
-            discord_max_size_mb_val = int(float(os.getenv("DISCORD_MAX_SIZE_MB", "10")))
-        except ValueError:
-            print("DISCORD_MAX_SIZE_MB 값이 잘못되었습니다. 기본값 10MB를 사용합니다.")
-            discord_max_size_mb_val = 10
+        discord_max_size_mb_val = int(os.getenv("DISCORD_MAX_SIZE_MB", "10"))
 
         return cls(
             discord_token=os.getenv("DISCORD_TOKEN", ""),
             discord_max_size_mb=discord_max_size_mb_val,
             telegram_token=os.getenv("TELEGRAM_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHANNEL", ""),
-            web_static_dir=os.getenv("WEB_STATIC_DIR", "web_static"),
+            web_static_dir=os.getenv("WEB_STATIC_DIR", str(PROJECT_ROOT / "web_static")),
             web_host=os.getenv("WEB_HOST", "127.0.0.1"),
             web_port=int(os.getenv("WEB_PORT", "8000")),
             web_image_ttl_seconds=int(os.getenv("WEB_IMAGE_TTL_SECONDS", str(3 * 60 * 60))),
@@ -100,6 +156,7 @@ class AppConfig:
             web_image_max_mb=int(os.getenv("WEB_IMAGE_MAX_MB", "12")),
             web_ingest_max_mb=int(os.getenv("WEB_INGEST_MAX_MB", "12")),
             web_upload_queue_size=int(os.getenv("WEB_UPLOAD_QUEUE_SIZE", "20")),
+            web_upload_queue_max_mb=int(os.getenv("WEB_UPLOAD_QUEUE_MAX_MB", "32")),
             web_freshness_seconds=int(os.getenv("WEB_FRESHNESS_SECONDS", "900")),
             web_gallery_url=os.getenv("WEB_GALLERY_URL", "http://127.0.0.1:8000"),
             web_ingest_token=os.getenv("WEB_INGEST_TOKEN", ""),
@@ -113,6 +170,8 @@ class AppConfig:
             arca_download_concurrency=int(os.getenv("ARCA_DOWNLOAD_CONCURRENCY", "2")),
             media_download_max_mb=int(os.getenv("MEDIA_DOWNLOAD_MAX_MB", "15")),
             media_max_pixels=int(os.getenv("MEDIA_MAX_PIXELS", "24000000")),
+            media_max_frames=int(os.getenv("MEDIA_MAX_FRAMES", "200")),
+            media_max_animation_pixels=int(os.getenv("MEDIA_MAX_ANIMATION_PIXELS", "60000000")),
             archive_path=os.getenv("ARCHIVE_PATH") or DEFAULT_ARCHIVE_PATH,
             dash_host=os.getenv("DASH_HOST", "127.0.0.1"),
             dash_base_url=os.getenv("DASH_BASE_URL", "").strip().rstrip("/"),
@@ -205,3 +264,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+
+install_logging_privacy()

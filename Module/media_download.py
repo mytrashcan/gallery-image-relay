@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import requests
 
@@ -70,9 +71,11 @@ def download_limited(
     chunk_size: int = 64 * 1024,
     retry_policy: RetryPolicy | None = None,
     on_attempt: Callable[[], None] | None = None,
+    is_allowed_url: Callable[[str], bool] | None = None,
 ) -> bytes:
     """Stream a response into memory while enforcing a hard byte limit."""
     policy = retry_policy or DEFAULT_MEDIA_RETRY_POLICY
+    deadline = time.monotonic() + max(30.0, timeout * 4)
     for attempt in range(1, policy.max_attempts + 1):
         if on_attempt is not None:
             on_attempt()
@@ -80,7 +83,23 @@ def download_limited(
             sleep_sync(policy.request_interval)
         response = None
         try:
-            response = client.get(url, headers=headers, timeout=timeout, stream=True)
+            current_url = url
+            for redirect in range(4):
+                if time.monotonic() >= deadline:
+                    raise requests.Timeout("download deadline exceeded")
+                if is_allowed_url is not None and not is_allowed_url(current_url):
+                    raise MediaDownloadRejected("request destination rejected")
+                if redirect and on_attempt is not None:
+                    on_attempt()
+                response = client.get(current_url, headers=headers, timeout=timeout, stream=True, allow_redirects=False)
+                if getattr(response, "status_code", None) not in {301, 302, 303, 307, 308}:
+                    break
+                location = response.headers.get("location")
+                if not location or redirect == 3 or is_allowed_url is None:
+                    raise MediaDownloadRejected("redirect rejected")
+                current_url = urljoin(current_url, location)
+                response.close()
+                response = None
             status = getattr(response, "status_code", None)
             content_type = response.headers.get("content-type", "")
             if status in {403, 503} and "html" in content_type.casefold():
@@ -97,19 +116,23 @@ def download_limited(
                     declared_size = int(content_length)
                 except ValueError as exc:
                     raise MediaDownloadRejected("invalid content-length") from exc
+                if declared_size < 0:
+                    raise MediaDownloadRejected("invalid content-length")
                 if declared_size > max_bytes:
                     raise MediaDownloadTooLarge("media exceeds download limit")
 
             data = bytearray()
             challenge_candidate = "html" in content_type.casefold()
             for chunk in response.iter_content(chunk_size=chunk_size):
+                if time.monotonic() >= deadline:
+                    raise requests.Timeout("download deadline exceeded")
                 if not chunk:
                     continue
+                if len(data) + len(chunk) > max_bytes:
+                    raise MediaDownloadTooLarge("media exceeds download limit")
                 data.extend(chunk)
                 if challenge_candidate and len(data) <= 128 * 1024:
-                    raise_for_cloudflare_challenge(response, body=data)
-                if len(data) > max_bytes:
-                    raise MediaDownloadTooLarge("media exceeds download limit")
+                    raise_for_cloudflare_challenge(response, body=bytes(data))
             return bytes(data)
         except (MediaDownloadRejected, BlockedByChallenge):
             raise
@@ -207,6 +230,7 @@ def download_media_candidate(
                 max_bytes=max_bytes,
                 retry_policy=retry_policy,
                 on_attempt=reserve_attempt,
+                is_allowed_url=is_allowed_url,
             )
             extension = image_extension_from_data(image_data)
             _validate_expected_type(candidate.expected_media_type, extension)

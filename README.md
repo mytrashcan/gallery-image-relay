@@ -8,12 +8,12 @@
 
 > **No persistent image storage:** gallery images exist only in the web process's volatile **RAM**. Image bytes, titles, and URLs are never saved to disk or a database; they expire automatically and disappear immediately whenever the web process restarts.
 >
-> To prevent successful deliveries from being repeated after a crawler restart, the relay stores only minimal deduplication metadata in SQLite: namespaced post IDs, image SHA256 hashes, and delivery timestamps. The ledger defaults to `var/delivery_archive.sqlite3` and can be moved with `ARCHIVE_PATH`; it never contains image bytes.
+> To prevent successful deliveries from being repeated after a crawler restart, the relay stores only minimal deduplication metadata in SQLite: namespaced post IDs, image SHA256 hashes, destination receipt IDs, and delivery timestamps. The ledger defaults to `var/delivery_archive.sqlite3` and can be moved with `ARCHIVE_PATH`; it never contains image bytes.
 
 Two crawler types are supported:
 
 - **DCInside** (`Module/crawler.py` + `Module/dcbot.py`) - waits behind a 20-post moderation window, prefers the original attachment, and relays one image per post to Discord and Telegram.
-- **Arcalive** (`Module/arca_crawler.py` + `Module/arca_bot.py`) - waits behind a 10-image-post moderation window, accesses pages through a residential SOCKS proxy when configured, and relays every image in a post to Discord.
+- **Arcalive** (`Module/arca_crawler.py` + `Module/arca_bot.py`) - waits behind a 10-image-post moderation window, accesses pages through a residential SOCKS proxy when configured, and relays up to four images per post to Discord.
 
 Both crawlers share the same image pipeline (`ImageHandler` for compression/dedup), delivery layer (`MessageSender`), and the optional ephemeral web gallery (`web_app`).
 
@@ -21,7 +21,7 @@ Both crawlers share the same image pipeline (`ImageHandler` for compression/dedu
 
 - Scrapes images from DCInside and automatically posts to Discord and Telegram
 - Arcalive (arca.live) crawler using `cloudscraper`; when hosted on a cloud VM, a home-machine SOCKS proxy handles the Cloudflare managed challenge that flags datacenter IPs (see "Arcalive: Cloudflare bypass" below)
-- All-image extraction per post (Arcalive) vs single-image extraction (DCInside, spam prevention)
+- Multi-image extraction, capped at four images per post (Arcalive) vs single-image extraction (DCInside, spam prevention)
 - Discord multi-embed delivery for Arcalive (up to 10 images per message)
 - Both crawlers share the same ephemeral web gallery, with a source filter (DCInside / Arcalive / per-gallery) in the UI
 - Works seamlessly on cloud environments like Oracle Cloud
@@ -67,10 +67,10 @@ Both crawlers share the same image pipeline (`ImageHandler` for compression/dedu
 
 4. Install the required dependencies:
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements.txt -c constraints.txt
    ```
 
-5. Create a `.env` file in the project root (or inside `Module/`):
+5. Create a `.env` file in the project root. Explicit environment variables take precedence; the legacy `Module/.env` is only a fallback:
    ```env
    DISCORD_TOKEN=your_discord_bot_token
    TELEGRAM_TOKEN=your_telegram_bot_token
@@ -113,11 +113,11 @@ Edit `galleries.json` and add a new entry:
 {
     "my_dc_gallery": {
         "base_url": "https://gall.dcinside.com/mgallery/board/lists/?id=my_gallery_id",
-        "channel_ids": ["discord_channel_id_1"]
+        "channel_ids": ["123456789012345678"]
     },
     "my_arca_gallery": {
         "base_url": "https://arca.live/b/myboard",
-        "channel_ids": ["discord_channel_id_1"],
+        "channel_ids": ["123456789012345678"],
         "type": "arca"
     }
 }
@@ -128,7 +128,7 @@ No code changes required - just restart the launcher.
 
 ## Web gallery (optional)
 
-You can serve the collected images as a live, **ephemeral** web feed - a Pinterest-style masonry grid at `http://<host>:8000/` that updates roughly in real time (the page polls every 5 seconds and only adds new cards). Post titles link back to their original source posts.
+You can serve the collected images as a live, **ephemeral** web feed - a Pinterest-style masonry grid at `http://<host>:8000/` that updates roughly in real time (the page polls every 5 seconds while visible, backs off to 60 seconds after errors, and updates existing cards). Post titles link back to their original source posts.
 
 **Images are stored only in volatile process memory (RAM), never on disk or in a database.** The web process owns a bounded in-memory store. Images disappear when they exceed the TTL, item limit, or byte limit, and every image disappears immediately when the web process restarts.
 
@@ -136,7 +136,7 @@ Crawler processes publish bytes to the web process through an authenticated loca
 
 Thumbnails are generated into `BytesIO` and count toward the same memory budget. Image responses use `Cache-Control: no-store` so browsers and CDNs are instructed not to retain them.
 
-The production systemd unit disables core dumps and swap for the web process. Copies sent to Discord, Telegram, browsers, or other external systems remain outside this server's control.
+The systemd units disable core dumps and swap for web and crawler processes; host crash collectors and hibernation require separate operator controls. Copies sent to Discord, Telegram, browsers, or other external systems remain outside this server's control.
 
 > ⚠️ **`LimitCORE=0` alone does not stop piped core collectors.** When `/proc/sys/kernel/core_pattern` pipes crashes to a collector (Ubuntu's `apport`, or `systemd-coredump`), the kernel ignores the `RLIMIT_CORE` size limit - so a native crash (e.g. in Pillow's decoders) could still dump the whole store's image bytes to disk under `/var/crash` or `/var/lib/systemd/coredump`. On the server, check `cat /proc/sys/kernel/core_pattern`; if it pipes to apport run `sudo systemctl mask apport.service`, and for systemd-coredump set `Storage=none` + `ProcessSizeMax=0` in `/etc/systemd/coredump.conf`.
 
@@ -197,23 +197,20 @@ The crawler-process panel (PID/memory/uptime) can't be shown this way - `psutil`
 
 `cloudscraper` alone gets Arcalive's older JS challenge, but arca.live also serves a **Cloudflare managed challenge** to IPs with a datacenter reputation (Oracle Cloud, AWS, etc.) - a real browser is required to solve it, and headless Chromium on a cloud VM tends to get flagged too (tried and reverted; see git history for `nodriver`/Xvfb attempts). A residential IP (e.g. a home Mac) is not challenged at all.
 
-The fix: route only the Arcalive crawler's requests through a home machine via a **reverse SOCKS proxy over SSH**, so arca.live sees a residential IP while everything else (DCInside, image downloads from the `namu.la` CDN, the web gallery) still runs directly on the cloud VM.
+The fix: route only the Arcalive crawler's requests through a home machine via a **reverse SOCKS proxy over SSH**, so arca.live sees a residential IP while DCInside and relay deliveries run directly on the cloud VM. Both Arcalive HTML and CDN image requests use the configured proxy; each concurrent image worker reuses its own Session.
 
 ```bash
 # On the home machine (Mac): open a reverse dynamic (SOCKS) forward to the server.
 # No destination after the port -> ssh itself acts as the SOCKS proxy and opens
 # the real outbound connection *from this machine*.
-ssh -N -R 1080 ubuntu@<server-ip>
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 127.0.0.1:1080 ubuntu@<server-ip>
 ```
 
-`com.dcselfie.arca-tunnel.plist` wraps this in `autossh` as a macOS LaunchAgent (auto-reconnect, starts at login):
-```bash
-cp com.dcselfie.arca-tunnel.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.dcselfie.arca-tunnel.plist
-```
+The private `com.dcselfie.arca-tunnel.plist` is not shipped in this repository. Use a local LaunchAgent or autossh supervisor for the command above; never put private hostnames, SSH keys, or proxy credentials in tracked files. See [deployment guidance](docs/deployment.md).
+
 On the server, point the crawler at the tunnel and restart:
 ```bash
-echo 'ARCA_SOCKS_PROXY=socks5://localhost:1080' >> .env
+echo 'ARCA_SOCKS_PROXY=socks5h://localhost:1080' >> .env
 sudo systemctl restart dcselfie-launcher
 ```
 Verify the egress IP actually changed: `curl -x socks5h://localhost:1080 https://ifconfig.co` should print the home machine's IP, not the server's.
@@ -245,9 +242,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now dcselfie-launcher dcselfie-web
 ```
 
-Subsequent OCI deployments should use `./deploy_oci.sh`; it pulls main, creates the ingest secret when missing, refreshes dependencies, restarts web before crawlers, and verifies health.
+Subsequent OCI deployments use `./deploy_oci.sh` from a clean checkout. It verifies a fast-forward update, stages a separate constrained virtual environment, checks imports/configuration, then stops workers before replacing code. Failed readiness checks restore the previous commit, venv and existing systemd units. Rollback environments are retained in `.deploy/`; see [deployment and recovery](docs/deployment.md) before first use.
 
-The web service reads the project's `.env` through `EnvironmentFile`, so `WEB_INGEST_TOKEN` is available before Python starts. The launcher requires the web service and waits for its authenticated ingest endpoint before it starts crawlers. After changing the unit files, run `sudo systemctl daemon-reload`. For a manual restart, use `sudo systemctl restart dcselfie-web && sudo systemctl restart dcselfie-launcher`.
+Both services load the root `.env` through the same Python configuration loader. The launcher wants the web service and waits for its authenticated ingest endpoint before starting crawlers; a web restart does not stop the launcher. After changing the unit files, run `sudo systemctl daemon-reload`. For a manual restart, use `sudo systemctl restart dcselfie-web && sudo systemctl restart dcselfie-launcher`.
 
 Secrets (`DISCORD_TOKEN`, `ARCA_SOCKS_PROXY`, etc.) go in the project's `.env`, never in the unit files - see the warning in "Arcalive: Cloudflare bypass" above.
 
@@ -273,7 +270,6 @@ Notes for small instances (1 GB RAM free tier):
 ├── .github/workflows/ci.yml  # CI: lint + tests on Python 3.11/3.12
 ├── dcselfie-launcher.service  # systemd unit: crawlers (see "Running on a server")
 ├── dcselfie-web.service       # systemd unit: web gallery
-├── com.dcselfie.arca-tunnel.plist  # macOS LaunchAgent: reverse SOCKS tunnel for Arcalive
 ├── dcselfie.sh             # macOS launchd management CLI (install/start/stop/status/dash)
 ├── Module/
 │   ├── config.py          # Environment variables, headers, logging setup
@@ -307,6 +303,7 @@ Notes for small instances (1 GB RAM free tier):
 | `WEB_MEMORY_MAX_MB` | env | 256 | Hard cap for original and thumbnail bytes |
 | `WEB_IMAGE_MAX_MB` | env | 12 | Per-image RAM cap; originals within the cap stay untouched |
 | `WEB_INGEST_MAX_MB` | env | 12 | Maximum localhost upload body |
+| `WEB_UPLOAD_QUEUE_MAX_MB` | env | 32 | Per-crawler original-byte cap, including the in-flight web request |
 | `WEB_UPLOAD_QUEUE_SIZE` | env | 20 | Per-crawler bounded background queue for web uploads |
 | `WEB_FRESHNESS_SECONDS` | env | 900 | Age threshold reported by `/healthz` |
 | `WEB_INGEST_TOKEN` | `.env` | required | Shared secret for crawler-to-web ingestion |
@@ -317,29 +314,48 @@ Notes for small instances (1 GB RAM free tier):
 | `ARCA_SOCKS_PROXY` | `.env` (never commit) | unset | `socks5://...` proxy the Arcalive crawler routes through - see "Arcalive Cloudflare bypass" below |
 | `ARCA_DOWNLOAD_CONCURRENCY` | env | 2 | Bounded concurrent Arcalive CDN downloads per crawler |
 | `MEDIA_DOWNLOAD_MAX_MB` | env | 15 | Hard streaming limit for each source image download |
+| `MEDIA_MAX_FRAMES` | env | 200 | Maximum frames accepted from an animated source image |
+| `MEDIA_MAX_ANIMATION_PIXELS` | env | 60000000 | Sum of decoded canvas pixels across animation frames |
 | `MEDIA_MAX_PIXELS` | env | 24000000 | Pixel-count limit checked before image processing |
 | `TURNSTILE_SITEKEY` / `TURNSTILE_SECRET` | `.env` (never commit) | unset | Cloudflare Turnstile bot gate for the web gallery; unset disables it entirely |
-| `WEB_ORIGIN_SECRET` | `.env` (never commit) | unset | When set, a request carrying `cf-connecting-ip` must also carry the matching `x-origin-secret` header or the header is ignored (socket peer IP used instead). Set the same value in a Cloudflare Transform Rule that injects `x-origin-secret`. For stronger protection, also enable Cloudflare Authenticated Origin Pulls (mTLS) on the zone; unset keeps legacy behavior |
+| `WEB_ORIGIN_SECRET` | `.env` (never commit) | unset | When set, a request carrying `cf-connecting-ip` must also carry the matching `x-origin-secret` header or the header is ignored (socket peer IP used instead). Set the same value in a Cloudflare Transform Rule that injects `x-origin-secret`. For stronger protection, also enable Cloudflare Authenticated Origin Pulls (mTLS) on the zone; unset always uses the socket peer; untrusted proxy headers are ignored |
 
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt -c constraints.txt
 
 # Run tests
 pytest
 
-# Lint
+# Lint and offline import/configuration smoke check
 ruff check .
+python scripts/check_install.py
 ```
 
 CI (GitHub Actions) runs ruff and the test suite on every push to `main` and on pull requests.
+
+## Delivery, privacy and operational limits
+
+A post/hash is acknowledged only after **every configured Discord channel and (for DCInside) Telegram** succeeds. Each successful destination/media pair is committed to SQLite immediately after the transport returns; retries and crawler restarts skip those receipts. Web delivery stays best effort: its bounded RAM queue can drop images during prolonged outage and does not control post acknowledgement. Existing post/hash rows remain compatible. Destination receipts added by this release cannot reconstruct failures already acknowledged by older versions.
+
+This is not exactly-once delivery: a remote service can accept a message just before a timeout or process crash, before SQLite can record it. That uncertain interval can produce a duplicate. Never delete the archive to fix a lock or corruption error. Keep SQLite on a local filesystem, back it up with SQLite's backup API, and retain it across deployments. `DeliveryArchive.prune(before)` is an explicit retention operation; pruning allows old content to be delivered again and is not run automatically.
+
+Crawlers select eligible posts oldest-first **within the current first list page**. DC skips the newest 20 normal posts; Arcalive skips the newest 10 image posts. These are delay heuristics, not content moderation. There is no historical pagination/backfill guarantee: busy boards, downtime, permanently failing oldest posts, and hourly rotation when there are more than five galleries per source can cause missed posts. See the review's recommended bounded catch-up work before relying on lossless capture.
+
+Turnstile, when configured, protects `/feed`, `/images/*` and `/like/*` regardless of proxy headers. Configure both keys. `/healthz` remains accessible and its `fresh` field is an activity indicator, not proof that every destination is healthy. The terminal dashboard's recent-feed panel cannot pass Turnstile; health/process panels still work. A matching `WEB_ORIGIN_SECRET` is required to trust Cloudflare client IPs. Use the [Cloudflare ingress example](docs/cloudflared.example.yml) to keep `/internal/*` off the public tunnel, plus edge request/connection limits.
+
+Application image buffers never use temporary files. Root application logging redacts HTTP/SOCKS URLs, configured tokens and transport exception details; post titles and filenames have been removed from crawler logs. Public request access logs and optional honeypot diagnostics are separate metadata. Honeypot events default to a bounded RAM ring (1,000 events, 100/minute); `HONEYPOT_LOG_PATH` explicitly enables a rotating file (4 MiB plus one backup) containing bounded IP/UA/path metadata. Set OS journal/log rotation and avoid HTTP debug logging. This application cannot erase copies retained by external platforms, browsers, crash collectors, swap, hibernation or infrastructure logs.
+
+Default web capacity counts original and thumbnail byte lengths (256 MiB), not total process RSS. Two active ingest requests and four verification requests are admitted; overload returns 503 and body reads time out after 10 seconds. The TTL sweeper runs every second and clears RAM on shutdown. Source HTML is capped at 4 MiB, media at 15 MiB, and redirects are revalidated before each fetch. Provision memory for decoded images, queues and the Python runtime as well as the store. Arcalive concurrency is validated in the range 1–4.
+
+See [production review and change rationale](docs/production-hardening.md) and [deployment/recovery](docs/deployment.md).
 
 ## Discord Commands
 
 | Command | Description |
 |---------|-------------|
-| `!쓰담쓰담` | Clear image hash cache (resets duplicate detection) |
+| `!쓰담쓰담` | Clear the process-local image hash cache; durable receipts remain |
 
 ## License
 This project is licensed under the GPL License.

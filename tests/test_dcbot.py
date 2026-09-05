@@ -22,6 +22,7 @@ async def successful_discord_payload(
     embeds,
     destination_id,
     requested_media,
+    on_delivered=None,
 ):
     return ChannelDelivery(
         transport="discord",
@@ -196,7 +197,7 @@ async def test_start_crawling_processes_post_with_image(mock_dependencies, bot):
         "post_id": "3",
         "has_image": True,
     }
-    crawler_mock.get_latest_post.side_effect = [post, post, post]
+    crawler_mock.get_latest_post.return_value = post
 
     image_handler_mock.download_images.return_value = [
         (io.BytesIO(b"discord"), io.BytesIO(b"telegram"), "img.png", False, b"original", "hash"),
@@ -264,7 +265,7 @@ async def test_failed_distribution_does_not_acknowledge_image_hash(mock_dependen
 
 
 @pytest.mark.asyncio
-async def test_telegram_success_acknowledges_when_discord_fails(mock_dependencies, bot):
+async def test_telegram_success_does_not_acknowledge_when_discord_fails(mock_dependencies, bot):
     _, image_handler_mock = mock_dependencies
     image_handler_mock.download_images.return_value = [
         (io.BytesIO(b"discord"), io.BytesIO(b"telegram"), "img.png", False, b"original", "hash"),
@@ -283,10 +284,10 @@ async def test_telegram_success_acknowledges_when_discord_fails(mock_dependencie
 
     acknowledged = await bot.process_post({"title": "x", "link": "https://example.com"})
 
-    assert acknowledged is True
+    assert acknowledged is False
     bot.message_sender.send_discord_payload.assert_awaited_once()
     bot.message_sender.send_to_telegram.assert_awaited_once()
-    image_handler_mock.mark_hash_sent.assert_called_once_with("hash")
+    image_handler_mock.mark_hash_sent.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,8 @@ from types import FrameType
 from urllib import error, request
 
 import psutil
-from dotenv import load_dotenv
+
+from Module.config import PROJECT_ROOT, app_config, load_gallery_configs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,15 +23,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 1) 프로젝트 루트 .env 우선 로드 (DISCORD_TOKEN 등 주요 환경변수)
-load_dotenv()
-# 2) Module/.env 로드 (ARCA_SOCKS_PROXY 등 Module 전용 변수, 기존값 덮어쓰기 허용)
-env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "Module", ".env"))
-load_dotenv(env_path, override=True)
 
-# galleries.json에서 갤러리 목록 로드 (arca 갤러리 포함)
-with open(os.path.join(os.path.dirname(__file__), "galleries.json"), encoding="utf-8") as f:
-    gallery_configs = json.load(f)
+gallery_configs = load_gallery_configs()
 gallery_names = list(gallery_configs.keys())
 
 # DC/Arca 분리
@@ -91,7 +85,7 @@ def wait_for_web_gallery() -> bool:
 
     health_url = f"{base_url}/healthz"
     deadline = time.monotonic() + timeout_seconds
-    while True:
+    while not shutdown_requested:
         try:
             with request.urlopen(health_url, timeout=2) as response:
                 health = json.load(response)
@@ -119,6 +113,7 @@ def wait_for_web_gallery() -> bool:
             logger.error("웹 갤러리가 %s초 안에 준비되지 않았습니다: %s", timeout_seconds, health_url)
             return False
         time.sleep(1)
+    return False
 
 def signal_handler(sig: int, frame: FrameType | None) -> None:
     global shutdown_requested
@@ -135,8 +130,7 @@ def is_already_running(gallery_name: str) -> bool:
             cmdline = proc.info["cmdline"]
             if not cmdline:
                 continue
-            joined = " ".join(cmdline)
-            if "run_gallery.py" in joined and gallery_name in joined:
+            if str(PROJECT_ROOT / "run_gallery.py") in cmdline and gallery_name == cmdline[-1]:
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -146,12 +140,13 @@ def run_script(gallery_name: str) -> subprocess.Popen[bytes]:
     """run_gallery.py를 통해 갤러리 크롤러 실행 (DCInside/Arcalive 모두)"""
     python_executable = sys.executable
     process = subprocess.Popen(
-        [python_executable, "run_gallery.py", gallery_name],
+        [python_executable, str(PROJECT_ROOT / "run_gallery.py"), gallery_name],
+        cwd=PROJECT_ROOT,
     )
     logger.info(f"{gallery_name} 크롤러 실행됨 (PID: {process.pid})")
     return process
 
-def stop_processes(gallery_names: set[str], timeout: float = 10.0) -> None:
+def stop_processes(gallery_names: set[str], timeout: float = 90.0) -> None:
     """Terminate selected processes concurrently within one shared deadline."""
     running = [
         (gallery_name, state.process)
@@ -161,7 +156,10 @@ def stop_processes(gallery_names: set[str], timeout: float = 10.0) -> None:
     for gallery_name, process in running:
         logger.info(f"{gallery_name} 크롤러 종료 중...")
         if process.poll() is None:
-            process.terminate()
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
 
     deadline = time.monotonic() + timeout
     remaining = {name: process for name, process in running if process.poll() is None}
@@ -173,7 +171,10 @@ def stop_processes(gallery_names: set[str], timeout: float = 10.0) -> None:
     for gallery_name, process in remaining.items():
         logger.warning("%s 크롤러가 제때 종료되지 않아 강제 종료합니다.", gallery_name)
         if process.poll() is None:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
     for process in remaining.values():
         try:
             process.wait(timeout=2)
@@ -183,7 +184,7 @@ def stop_processes(gallery_names: set[str], timeout: float = 10.0) -> None:
         processes.pop(gallery_name, None)
 
 
-def stop_running_processes(timeout: float = 10.0) -> None:
+def stop_running_processes(timeout: float = 90.0) -> None:
     """Terminate the whole batch concurrently within one shared deadline."""
     stop_processes(set(processes), timeout)
 
@@ -342,6 +343,12 @@ def manage_crawlers() -> None:
 
 def main() -> None:
     """메인 실행 함수"""
+    if not app_config.discord_token:
+        raise SystemExit("DISCORD_TOKEN is required")
+    if dc_galleries:
+        app_config.validate_required()
+    if app_config.web_gallery and not app_config.web_ingest_token:
+        raise SystemExit("WEB_INGEST_TOKEN is required with WEB_GALLERY=1")
     logger.info("크롤러 관리 프로세스를 시작합니다.")
     if not wait_for_web_gallery():
         raise SystemExit("웹 갤러리 준비 실패")

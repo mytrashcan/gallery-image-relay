@@ -18,7 +18,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="$(command -v python3)"
+PY="${DC_PYTHON:-$ROOT/venv/bin/python}"
+[[ -x "$PY" ]] || { echo "Create venv and install requirements first." >&2; exit 1; }
+umask 077
 CFD="$(command -v cloudflared || true)"
 LA="$HOME/Library/LaunchAgents"
 LOGS="$ROOT/logs"
@@ -26,7 +28,8 @@ DOM="gui/$(id -u)"
 
 # 필요하면 환경변수로 덮어쓰기 가능
 TUNNEL="${DC_TUNNEL:-dcgallery}"
-WEB_PORT="${WEB_PORT:-8000}"
+cd "$ROOT"
+WEB_PORT="$("$PY" -c 'from Module.config import app_config; print(app_config.web_port)')"
 STATIC_DIR="$ROOT/web_static"
 MAINT="$ROOT/.maintenance"   # 존재하면 웹 서버가 점검 페이지를 보여줌
 
@@ -35,72 +38,48 @@ W_LABEL="win.dcselfie.web"
 T_LABEL="win.dcselfie.tunnel"
 
 emit_plist() {
-  # $1=label  $2=logfile  $3=env_xml  $4...=program args
-  local label="$1" log="$2" env_xml="$3"; shift 3
-  local args_xml=""
-  for a in "$@"; do args_xml+="    <string>${a}</string>"$'\n'; done
-  cat > "$LA/$label.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${label}</string>
-  <key>ProgramArguments</key>
-  <array>
-${args_xml}  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-${env_xml}  </dict>
-  <key>WorkingDirectory</key><string>${ROOT}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${log}</string>
-  <key>StandardErrorPath</key><string>${log}</string>
-</dict>
-</plist>
-PLIST
+  local label="$1" log="$2"; shift 2
+  "$PY" "$ROOT/scripts/write_launchd_plist.py" "$LA/$label.plist" "$label" "$ROOT" "$log" "$@"
 }
-
-env_kv() { printf '    <key>%s</key><string>%s</string>\n' "$1" "$2"; }
 
 write_plists() {
   mkdir -p "$LA" "$LOGS"
 
   emit_plist "$C_LABEL" "$LOGS/crawler.log" \
-    "$(env_kv WEB_GALLERY 1; env_kv WEB_STATIC_DIR "$STATIC_DIR")" \
     "$PY" "$ROOT/launcher.py"
 
   emit_plist "$W_LABEL" "$LOGS/web.log" \
-    "$(env_kv WEB_HOST 127.0.0.1; env_kv WEB_PORT "$WEB_PORT"; env_kv WEB_STATIC_DIR "$STATIC_DIR")" \
     "$PY" "$ROOT/run_web_server.py"
 
   if [ -n "$CFD" ]; then
-    emit_plist "$T_LABEL" "$LOGS/tunnel.log" "" \
+    emit_plist "$T_LABEL" "$LOGS/tunnel.log" \
       "$CFD" "tunnel" "--config" "$HOME/.cloudflared/config.yml" "run" "$TUNNEL"
   fi
 }
 
 labels() {
   echo "$C_LABEL" "$W_LABEL"
-  [ -n "$CFD" ] && echo "$T_LABEL"
+  if [ -f "$LA/$T_LABEL.plist" ]; then echo "$T_LABEL"; fi
 }
 
-kill_manual() {
-  # install 전, 수동으로 떠 있던 동일 프로세스 정리 (포트/중복 충돌 방지)
-  pkill -f "launcher.py"        2>/dev/null || true
-  pkill -f "run_gallery.py"     2>/dev/null || true
-  pkill -f "run_web_server.py"  2>/dev/null || true
-  pkill -f "cloudflared tunnel run $TUNNEL" 2>/dev/null || true
-  sleep 1
+svc_load() {
+  for l in $(labels); do
+    if ! launchctl print "$DOM/$l" >/dev/null 2>&1; then
+      launchctl bootstrap "$DOM" "$LA/$l.plist"
+    fi
+  done
 }
-
-svc_load()   { for l in $(labels); do launchctl bootstrap "$DOM" "$LA/$l.plist" 2>/dev/null || true; done; }
-svc_unload() { for l in $(labels); do launchctl bootout "$DOM/$l" 2>/dev/null || true; done; }
+svc_unload() {
+  for l in $(labels); do
+    if launchctl print "$DOM/$l" >/dev/null 2>&1; then launchctl bootout "$DOM/$l"; fi
+  done
+}
 
 cmd_install() {
-  [ -f "$ROOT/.env" ] || echo "⚠️  $ROOT/.env 없음 - 봇 토큰 설정 필요"
+  [ -f "$ROOT/.env" ] || { echo "Configure $ROOT/.env first." >&2; exit 1; }
+  "$PY" "$ROOT/scripts/ensure_web_ingest_token.py" "$ROOT/.env"
+  chmod 600 "$ROOT/.env"
   write_plists
-  kill_manual
   svc_unload
   svc_load
   echo "✅ 설치 완료. 서비스 등록됨:"
@@ -109,7 +88,7 @@ cmd_install() {
 
 cmd_start()   { svc_load;   echo "▶️  시작"; cmd_status; }
 cmd_stop()    { svc_unload; echo "⏹  정지"; }
-cmd_restart() { for l in $(labels); do launchctl kickstart -k "$DOM/$l" 2>/dev/null || true; done; echo "🔄 재시작"; cmd_status; }
+cmd_restart() { svc_unload; svc_load; cmd_status; }
 cmd_uninstall(){ svc_unload; for l in $(labels); do rm -f "$LA/$l.plist"; done; echo "🗑  제거 완료"; }
 
 cmd_status() {
@@ -124,7 +103,7 @@ cmd_status() {
       printf '%-22s %-10s %s\n' "$l" "-" "✗ 미등록"
     fi
   done
-  if curl -s -o /dev/null -w '' "http://127.0.0.1:$WEB_PORT/healthz" 2>/dev/null; then
+  if curl --max-time 3 -fsS -o /dev/null -w '' "http://127.0.0.1:$WEB_PORT/healthz" 2>/dev/null; then
     echo "web: http://127.0.0.1:$WEB_PORT  →  https://dcselfie.win"
   fi
   if [ -f "$MAINT" ]; then

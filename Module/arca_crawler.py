@@ -19,11 +19,12 @@ from Module.config import app_config
 from Module.delivery_archive import DeliveryArchive, post_key
 from Module.lru_cache import LRUCache
 from Module.media_candidate import MediaCandidate
+from Module.page_fetch import SourcePageGone, fetch_page
 from Module.retry_policy import (
     BlockedByChallenge,
     RetryPolicy,
-    request_with_policy,
 )
+from Module.url_policy import https_host
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +53,14 @@ def _mask_proxy(url: str) -> str:
 
 
 def _fixed_arca_url(base_url: str, href: str) -> str | None:
-    candidate = urlsplit(urljoin(base_url, href))
     try:
+        resolved = urljoin(base_url, href)
+        candidate = urlsplit(resolved)
         has_custom_port = candidate.port is not None
-    except ValueError:
+    except (ValueError, TypeError):
         return None
     if (
-        candidate.scheme != "https"
+        not https_host(resolved, {"arca.live"})
         or candidate.hostname != "arca.live"
         or candidate.username
         or candidate.password
@@ -69,17 +71,17 @@ def _fixed_arca_url(base_url: str, href: str) -> str | None:
 
 
 def _is_allowed_image_url(url: str) -> bool:
-    candidate = urlsplit(url)
-    hostname = (candidate.hostname or "").lower()
     try:
+        candidate = urlsplit(url)
+        hostname = (candidate.hostname or "").lower()
         has_custom_port = candidate.port is not None
-    except ValueError:
+    except (ValueError, TypeError):
         return False
     # Arca.live는 2026-07-31 이미지 CDN을 *.namu.la에서 ac-o.arca.live(원본)로 이전.
     # ac.arca.live(썸네일, Cloudflare)는 원본(ac-o, Cogent)이 한국 망에서
     # 도달 불가일 때의 폴백으로 사용한다 (2026-08-20 실증: 200으로 서빙).
     return (
-        candidate.scheme == "https"
+        https_host(url, {hostname})
         and not candidate.username
         and not candidate.password
         and not has_custom_port
@@ -147,7 +149,12 @@ def _ordered_media_urls(img_tag) -> tuple[str, ...]:
     for source in sources:
         if not source:
             continue
-        resolved = urljoin(ARCA_BASE, source)
+        try:
+            resolved = urljoin(ARCA_BASE, source)
+        except (ValueError, TypeError):
+            continue
+        if not _is_allowed_image_url(resolved):
+            continue
         original = _original_image_variant(resolved)
         variants = (
             (_extension_variant(original, original_extension), original)
@@ -180,6 +187,7 @@ def _create_session():
     s = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True, "mobile": False},
     )
+    s.trust_env = False
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -217,10 +225,7 @@ class ArcaliveCrawler:
 
     def get_latest_posts(self, max_posts: int = 5) -> list[ArcaPost]:
         try:
-            res = request_with_policy(
-                lambda: self.session.get(self.base_url, timeout=15),
-                self.retry_policy,
-            )
+            html = fetch_page(self.session, self.base_url, "arcalive", self.retry_policy)
         except BlockedByChallenge:
             logger.warning("아카라이브 목록 Cloudflare challenge 감지")
             return []
@@ -228,10 +233,10 @@ class ArcaliveCrawler:
             logger.warning("아카라이브 목록 요청 실패: %s", type(e).__name__)
             return []
         except Exception as e:
-            logger.warning(f"아카라이브 목록 요청 실패: {e}")
+            logger.warning(f"아카라이브 목록 요청 실패: {type(e).__name__}")
             return []
 
-        soup = BeautifulSoup(res.text, "lxml", parse_only=_VROW_STRAINER)
+        soup = BeautifulSoup(html, "lxml", parse_only=_VROW_STRAINER)
         posts: list[ArcaPost] = []
 
         for vrow in soup.select("div.vrow.hybrid"):
@@ -251,7 +256,7 @@ class ArcaliveCrawler:
             if not self._has_sent(post["post_id"]):
                 new_posts.append(post)
 
-        return new_posts[:max_posts]
+        return sorted(new_posts, key=lambda post: int(post["post_id"]))[:max_posts]
 
     def mark_sent(self, post_id: str) -> None:
         """Acknowledge a post only after delivery succeeds."""
@@ -318,7 +323,7 @@ class ArcaliveCrawler:
 
     @staticmethod
     def _extract_post_id(href: str) -> str:
-        m = re.search(r"/b/[^/]+/(\d+)", href)
+        m = re.fullmatch(r"/b/[^/]+/([0-9]+)/?", urlsplit(href).path)
         return m.group(1) if m else ""
 
     # ---------- 개별 게시글 이미지 추출 ----------
@@ -326,10 +331,9 @@ class ArcaliveCrawler:
     def extract_all_images(self, post_url: str) -> list[MediaCandidate] | None:
         """Return extracted media, or ``None`` when the detail page was unavailable."""
         try:
-            res = request_with_policy(
-                lambda: self.session.get(post_url, timeout=15),
-                self.retry_policy,
-            )
+            html = fetch_page(self.session, post_url, "arcalive", self.retry_policy)
+        except SourcePageGone:
+            return []
         except BlockedByChallenge:
             logger.warning("아카라이브 게시글 Cloudflare challenge 감지: %s", post_url)
             return None
@@ -341,12 +345,15 @@ class ArcaliveCrawler:
             )
             return None
         except Exception as e:
-            logger.warning(f"아카라이브 게시글 요청 실패 ({post_url}): {e}")
+            logger.warning(f"아카라이브 게시글 요청 실패 ([metadata omitted]): {type(e).__name__}")
             return None
 
-        soup = BeautifulSoup(res.text, "lxml")
+        soup = BeautifulSoup(html, "lxml")
         images = []
         seen_urls = set()
+        if soup.select_one("div.article-body, .fr-view.article-content") is None:
+            logger.warning("Arca detail parser did not find article body")
+            return None
 
         body = soup.select_one("div.article-body")
         if body:
@@ -358,7 +365,7 @@ class ArcaliveCrawler:
             for img in content.find_all("img"):
                 self._collect_image(img, images, seen_urls, post_url)
 
-        logger.info(f"아카라이브 게시글 이미지 {len(images)}개 발견: {post_url}")
+        logger.info(f"아카라이브 게시글 이미지 {len(images)}개 발견: [metadata omitted]")
         return images
 
     def _collect_image(

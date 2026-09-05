@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -19,6 +20,11 @@ def post_key(post_id: str) -> str:
 def image_key(sha256: str) -> str:
     """Build a namespaced archive key for a delivered image hash."""
     return _namespaced_key("image", sha256)
+
+
+def destination_key(transport: str, destination: str, media_id: str) -> str:
+    """Collision-free receipt key; only identifiers, never image bytes or secrets."""
+    return "receipt:" + json.dumps([transport, destination, media_id], separators=(",", ":"))
 
 
 def _namespaced_key(kind: str, identifier: str) -> str:
@@ -69,7 +75,7 @@ class DeliveryArchive:
             ).fetchone()[0]
             if str(journal_mode).casefold() != "wal":
                 raise RuntimeError("delivery archive requires SQLite WAL mode")
-            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.execute("PRAGMA synchronous = FULL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS delivery_archive (
@@ -81,6 +87,24 @@ class DeliveryArchive:
                 ) WITHOUT ROWID
                 """
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS delivery_archive_age ON delivery_archive(delivered_at)"
+            )
+
+    def add_many(self, source: str, gallery: str, keys: list[str]) -> None:
+        """Commit one acknowledged payload atomically, preserving existing receipts."""
+        rows = [(*self._validate_fields(source, gallery, key), _utc_timestamp(self._clock())) for key in keys]
+        with self._lock:
+            connection = self._get_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.executemany(
+                    "INSERT OR IGNORE INTO delivery_archive VALUES (?, ?, ?, ?)", rows
+                )
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def check(self, source: str, gallery: str, key: str) -> bool:
         """Return whether a delivery key has already been acknowledged."""

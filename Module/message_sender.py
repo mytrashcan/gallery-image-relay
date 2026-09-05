@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from io import BytesIO
 
 import discord
@@ -12,6 +13,7 @@ from telegram.request import HTTPXRequest
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome
 from Module.embeds import make_image_embed
 from Module.image_handler import ImageHandler
+from Module.lifecycle import run_blocking
 from Module.media_pipeline import PreparedMedia
 
 logger = logging.getLogger(__name__)
@@ -31,11 +33,16 @@ class MessageSender:
             connect_timeout=30.0,
             read_timeout=30.0,
             write_timeout=30.0
-        )
-        self.telegram_bot = Bot(token=telegram_bot_token, request=request) if telegram_bot_token else None
+        ) if telegram_bot_token else None
+        self._telegram_request = request
+        self.telegram_bot = Bot(token=telegram_bot_token, request=request, get_updates_request=request) if request else None
         self.telegram_chat_id = telegram_chat_id
         # 413(파일 크기 초과) 시 재압축 폴백에 사용 (없으면 폴백 비활성화)
         self.image_handler = image_handler
+
+    async def close(self) -> None:
+        if self._telegram_request is not None:
+            await self._telegram_request.shutdown()
 
     def validate_image_buffer(self, image_buffer: BytesIO) -> bool:
         """메모리 버퍼의 이미지 유효성 검증"""
@@ -59,11 +66,11 @@ class MessageSender:
                 return True
 
             except (OSError, ValueError, SyntaxError) as e:
-                logger.error(f"이미지 버퍼 손상됨: {e}")
+                logger.error(f"이미지 버퍼 손상됨: {type(e).__name__}")
                 return False
 
         except (OSError, ValueError) as e:
-            logger.error(f"이미지 검증 실패: {e}")
+            logger.error(f"이미지 검증 실패: {type(e).__name__}")
             return False
 
     def recompress_for_discord(
@@ -129,7 +136,7 @@ class MessageSender:
         validated: bool = False,
     ) -> bool:
         try:
-            if not validated and not await asyncio.to_thread(self.validate_image_buffer, image_buffer):
+            if not validated and not await run_blocking(self.validate_image_buffer, image_buffer):
                 logger.error("Discord 전송 취소: 이미지 검증 실패")
                 return False
 
@@ -148,13 +155,13 @@ class MessageSender:
                     embed,
                 )
 
-            logger.info(f"Discord 전송 성공: {filename}")
+            logger.info("Discord 전송 성공: [metadata omitted]")
             return True
         except discord.HTTPException as exc:
-            logger.error(f"Discord HTTP 에러: {exc.status} - {exc.text}")
+            logger.error(f"Discord HTTP 에러: {exc.status} - {type(exc).__name__}")
             return False
         except Exception as exc:
-            logger.error(f"Discord 전송 실패: {type(exc).__name__}: {str(exc)}")
+            logger.error(f"Discord 전송 실패: {type(exc).__name__}: {type(exc).__name__}")
             return False
         finally:
             try:
@@ -170,28 +177,28 @@ class MessageSender:
         embed: discord.Embed,
     ) -> bool:
         if self.image_handler is None:
-            logger.error(f"Discord 재압축 불가: image handler 없음 ({filename})")
+            logger.error("Discord 재압축 불가: image handler 없음 ([metadata omitted])")
             return False
 
         try:
-            logger.warning(f"Discord 413 (파일 크기 초과): {filename} — 재압축 후 재시도")
-            recompressed = await asyncio.to_thread(
+            logger.warning("Discord 413 (파일 크기 초과): [metadata omitted] — 재압축 후 재시도")
+            recompressed = await run_blocking(
                 self.recompress_for_discord, channel, image_buffer, filename
             )
             if recompressed is None:
-                logger.error(f"Discord 재압축 실패: {filename}")
+                logger.error("Discord 재압축 실패: [metadata omitted]")
                 return False
             await channel.send(
                 file=discord.File(recompressed, filename=filename),
                 embed=embed,
             )
-            logger.info(f"Discord 재압축 전송 성공: {filename}")
+            logger.info("Discord 재압축 전송 성공: [metadata omitted]")
             return True
         except discord.HTTPException as exc:
-            logger.error(f"Discord 재압축 HTTP 에러: {exc.status} - {exc.text}")
+            logger.error(f"Discord 재압축 HTTP 에러: {exc.status} - {type(exc).__name__}")
             return False
         except Exception as exc:
-            logger.error(f"Discord 재압축 전송 실패: {type(exc).__name__}: {str(exc)}")
+            logger.error(f"Discord 재압축 전송 실패: {type(exc).__name__}: {type(exc).__name__}")
             return False
         finally:
             try:
@@ -208,6 +215,7 @@ class MessageSender:
         embeds: list[discord.Embed],
         destination_id: str,
         requested_media: tuple[str, ...],
+        on_delivered: Callable[[ChannelDelivery], None] | None = None,
     ) -> ChannelDelivery:
         """한 Discord 채널에 payload를 전송하고 413이면 항목별로 fallback한다."""
         if (
@@ -220,7 +228,7 @@ class MessageSender:
 
         for item in items:
             image_buffer = item.discord_buffer
-            if not item.validated and not await asyncio.to_thread(
+            if not item.validated and not await run_blocking(
                 self.validate_image_buffer, image_buffer
             ):
                 logger.error("Discord 배치 전송 취소: 이미지 검증 실패")
@@ -232,11 +240,11 @@ class MessageSender:
             return self._discord_delivery(destination_id, requested_media, requested_media)
         except discord.HTTPException as exc:
             if exc.status != 413:
-                logger.error(f"Discord HTTP 에러: {exc.status} - {exc.text}")
+                logger.error(f"Discord HTTP 에러: {exc.status} - {type(exc).__name__}")
                 return self._discord_delivery(destination_id, requested_media, ())
             logger.warning("Discord batch 413 — 항목별 전송으로 fallback")
         except Exception as exc:
-            logger.error(f"Discord 전송 실패: {type(exc).__name__}: {str(exc)}")
+            logger.error(f"Discord 전송 실패: {type(exc).__name__}: {type(exc).__name__}")
             return self._discord_delivery(destination_id, requested_media, ())
         finally:
             for item in items:
@@ -264,6 +272,10 @@ class MessageSender:
                 )
             if sent:
                 delivered_media.append(media_id)
+                if on_delivered is not None:
+                    # Persist before the next await: later fallback items can be
+                    # cancelled or fail without forgetting this confirmed send.
+                    on_delivered(self._discord_delivery(destination_id, (media_id,), (media_id,)))
             if len(items) > 1:
                 await asyncio.sleep(0.5)
 
@@ -312,7 +324,7 @@ class MessageSender:
             logger.debug("Telegram 봇이 설정되지 않음 — 전송 건너뜀")
             return False
 
-        if not validated and not await asyncio.to_thread(self.validate_image_buffer, image_buffer):
+        if not validated and not await run_blocking(self.validate_image_buffer, image_buffer):
             logger.error("Telegram 전송 취소: 이미지 검증 실패")
             return False
 
@@ -333,18 +345,18 @@ class MessageSender:
                         filename=filename
                     )
 
-                logger.info(f"Telegram 전송 성공: {filename}")
+                logger.info("Telegram 전송 성공: [metadata omitted]")
                 return True
 
             except Exception as e:
                 error_name = type(e).__name__
                 if "TimedOut" in error_name or "Timed out" in str(e):
-                    logger.warning(f"Telegram 타임아웃 (시도 {attempt + 1}/{max_retries}): {filename}")
+                    logger.warning(f"Telegram 타임아웃 (시도 {attempt + 1}/{max_retries}): [metadata omitted]")
                     if attempt < max_retries - 1:
                         await asyncio.sleep(2 * (attempt + 1))  # 점진적 대기 (2초, 4초, 6초)
                         continue
 
-                logger.error(f"Telegram 전송 실패: {error_name}: {str(e)}")
+                logger.error(f"Telegram 전송 실패: {error_name}: {type(e).__name__}")
                 return False
 
         return False

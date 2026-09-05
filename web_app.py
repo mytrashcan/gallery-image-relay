@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import time
 import urllib.parse
 import urllib.request
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
@@ -17,6 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 
 from honeypot_trap import HoneypotRecorder, install_trap
 from Module.config import app_config
+from Module.lifecycle import run_blocking
 from Module.lru_cache import LRUCache
 from Module.memory_gallery import ImageTooLarge, InvalidImage, MemoryGalleryStore
 
@@ -85,16 +88,25 @@ def _client_ip(request: Request) -> str:
     if ip is not None:
         secret = app_config.web_origin_secret
         supplied = request.headers.get("x-origin-secret", "")
-        if not secret or hmac.compare_digest(
+        if secret and hmac.compare_digest(
             secret.encode(), supplied.encode("latin-1", "backslashreplace")
         ):
-            return ip
+            try:
+                return str(ipaddress.ip_address(ip))
+            except ValueError:
+                pass
     return request.client.host if request.client else "unknown"
 
 
 def _rate_limited(bucket: dict, ip: str, window: float, max_count: int) -> bool:
     """슬라이딩 윈도우 방식 IP별 요청 수 제한. 용도별로 별도 bucket을 넘겨 재사용한다."""
     now = time.time()
+    if ip not in bucket and len(bucket) >= 10000:
+        for key, (_, start) in list(bucket.items()):
+            if now - start > window:
+                del bucket[key]
+        if len(bucket) >= 10000:
+            return True
     count, start = bucket.get(ip, (0, now))
     if now - start > window:
         count, start = 0, now
@@ -127,21 +139,22 @@ def _ts_enabled() -> bool:
     return bool(_ts_secret())
 
 
-async def _read_verify_body(request: Request) -> bytes | None:
+async def _read_verify_body(request: Request, max_bytes: int = _VERIFY_MAX_BYTES) -> bytes | None:
     """Read a small Turnstile payload without allowing unbounded buffering."""
     content_length = request.headers.get("content-length")
     if content_length:
         try:
-            if int(content_length) > _VERIFY_MAX_BYTES:
+            if int(content_length) > max_bytes:
                 return None
         except ValueError:
             pass
 
     data = bytearray()
-    async for chunk in request.stream():
-        if len(data) + len(chunk) > _VERIFY_MAX_BYTES:
-            return None
-        data.extend(chunk)
+    async with asyncio.timeout(10):
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > max_bytes:
+                return None
+            data.extend(chunk)
     return bytes(data)
 
 
@@ -169,7 +182,7 @@ def _ts_cookie_valid(value: str, ip: str) -> bool:
         return False
     payload = f"{exp}.{ip}"
     good = hmac.new(_ts_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, good)
+    return hmac.compare_digest(sig.encode("utf-8"), good.encode())
 
 
 def _ts_siteverify(token: str, remoteip: str) -> bool:
@@ -232,9 +245,25 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
     _install_access_log_privacy_filter()
     gallery_store = store or _build_store()
     ingest_slots = asyncio.Semaphore(2)
+    verify_slots = asyncio.Semaphore(4)
+    verify_rate = {}
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async def expire():
+            while True:
+                await asyncio.sleep(1)
+                gallery_store.stats()
+        expiry = asyncio.create_task(expire())
+        try:
+            yield
+        finally:
+            expiry.cancel()
+            await asyncio.gather(expiry, return_exceptions=True)
+            gallery_store.clear()
     # 공개용 이미지 피드일 뿐 소비 대상 API가 아니므로 대화형 문서/스키마는 끈다
     # (불필요한 내부 라우트 노출 방지).
-    app = FastAPI(title="Gallery Image Relay", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Gallery Image Relay", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
     def _page(name: str) -> HTMLResponse:
         f = static_dir / name
@@ -248,6 +277,11 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
         path = request.url.path
+        if path.startswith(("/images/", "/like/")):
+            if _maintenance_on():
+                return JSONResponse({"error": "maintenance"}, status_code=503, headers={"Cache-Control": "no-store"})
+            if _ts_enabled() and not _ts_cookie_valid(request.cookies.get(_TS_COOKIE, ""), _client_ip(request)):
+                return JSONResponse({"error": "verification required"}, status_code=403, headers={"Cache-Control": "no-store"})
         resp = await call_next(request)
         if path.startswith("/images/") or path in ("/feed", "/"):
             resp.headers["Cache-Control"] = "no-store"
@@ -366,15 +400,18 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
                     return JSONResponse({"error": "payload too large"}, status_code=413)
             except ValueError:
                 return JSONResponse({"error": "invalid content length"}, status_code=400)
+        if ingest_slots.locked():
+            return JSONResponse({"error": "ingest busy"}, status_code=503, headers={"Retry-After": "1"})
         async with ingest_slots:
-            data = bytearray()
-            async for chunk in request.stream():
-                data.extend(chunk)
-                if len(data) > max_bytes:
-                    return JSONResponse({"error": "payload too large"}, status_code=413)
             try:
-                item = await asyncio.to_thread(
-                    gallery_store.put, bytes(data), filename, title, link, gallery
+                data = await _read_verify_body(request, max_bytes)
+            except TimeoutError:
+                return JSONResponse({"error": "request timeout"}, status_code=408)
+            if data is None:
+                return JSONResponse({"error": "payload too large"}, status_code=413)
+            try:
+                item = await run_blocking(
+                    gallery_store.put, data, filename, title, link, gallery
                 )
             except InvalidImage:
                 return JSONResponse({"error": "invalid image"}, status_code=415)
@@ -395,11 +432,10 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         ip = _client_ip(request)
         if _rate_limited(_feed_ip_rate, ip, _FEED_RATE_WINDOW, _FEED_RATE_MAX):
             return JSONResponse({"error": "too many requests"}, status_code=429)
-        if _maintenance_on() and request.headers.get("cf-connecting-ip"):
+        if _maintenance_on():
             return JSONResponse({"error": "maintenance"}, status_code=503)
-        # Cloudflare를 거친 공개 요청(cf-connecting-ip 존재)만 Turnstile 통과를 요구한다.
-        # 로컬 직접 접근(대시보드 등)은 헤더가 없어 그대로 허용.
-        if _ts_enabled() and request.headers.get("cf-connecting-ip"):
+        # Turnstile is enforced independently of caller-controlled proxy headers.
+        if _ts_enabled():
             if not _ts_cookie_valid(request.cookies.get(_TS_COOKIE, ""), ip):
                 return JSONResponse({"error": "verification required"}, status_code=403)
         return JSONResponse(gallery_store.snapshot(limit))
@@ -408,18 +444,26 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
     async def verify(request: Request) -> Response:
         if not _ts_enabled():
             return JSONResponse({"ok": True})
-        raw_body = await _read_verify_body(request)
-        if raw_body is None:
-            return JSONResponse({"error": "payload too large"}, status_code=413)
-        try:
-            body = json.loads(raw_body)
-        except (ValueError, UnicodeError, RecursionError):
-            body = {}
-        token = body.get("token") if isinstance(body, dict) else None
-        if not isinstance(token, str) or not token:
-            return JSONResponse({"ok": False}, status_code=403)
-        ip = request.headers.get("cf-connecting-ip", "")
-        ok = await asyncio.to_thread(_ts_siteverify, token, ip)
+        ip = _client_ip(request)
+        if _rate_limited(verify_rate, ip, 60, 20):
+            return JSONResponse({"error": "too many requests"}, status_code=429, headers={"Retry-After": "60"})
+        if verify_slots.locked():
+            return JSONResponse({"error": "verification busy"}, status_code=503, headers={"Retry-After": "1"})
+        async with verify_slots:
+            try:
+                raw_body = await _read_verify_body(request)
+            except TimeoutError:
+                return JSONResponse({"error": "request timeout"}, status_code=408)
+            if raw_body is None:
+                return JSONResponse({"error": "payload too large"}, status_code=413)
+            try:
+                body = json.loads(raw_body)
+            except (ValueError, UnicodeError, RecursionError):
+                body = {}
+            token = body.get("token") if isinstance(body, dict) else None
+            if not isinstance(token, str) or not token:
+                return JSONResponse({"ok": False}, status_code=403)
+            ok = await run_blocking(_ts_siteverify, token, ip)
         if not ok:
             return JSONResponse({"ok": False}, status_code=403)
         resp = JSONResponse({"ok": True})

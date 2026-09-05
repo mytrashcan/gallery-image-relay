@@ -435,25 +435,7 @@
       return /^https?:\/\//i.test(u) ? u : '';
     }
 
-    // ── 원본 이미지 사전 프리페치 ──
-    // 카드가 뷰포트 300px 앞에 들어오면(=곧 보일 가능성이 큼) 원본을 백그라운드로
-    // 미리 받아 브라우저 HTTP 캐시에만 데워둔다(DOM에는 안 넣음 — 보이지 않음,
-    // 전송량은 안 줄지만 화면에 나타난 카드만 대상이라 무제한 프리페치는 아님).
-    // 실제로 호버하면 mouseover 핸들러가 캐시에서 즉시 로드하므로 네트워크
-    // 왕복이 거의 사라지고, 체감 지연은 사실상 180ms 페이드 트랜지션만 남는다.
-    const prefetchObserver = ('IntersectionObserver' in window)
-      ? new IntersectionObserver(entries => {
-          for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
-            const card = entry.target;
-            prefetchObserver.unobserve(card);
-            if (card.dataset.fullPrefetched) continue;
-            card.dataset.fullPrefetched = '1';
-            const pre = new Image();
-            pre.src = card.dataset.fullSrc;
-          }
-        }, { rootMargin: '300px 0px', threshold: 0 })
-      : null;
+    // Originals use no-store; prefetching them would download them twice.
 
     function makeCard(it) {
       // 제목·링크·이미지 URL은 dcinside 게시글에서 오는 신뢰 불가 입력이므로,
@@ -470,7 +452,6 @@
       const full = safeUrl(it.url);
       if (src !== full && full) {
         article.dataset.fullSrc = full; // 호버 시 원본 교체용
-        if (prefetchObserver) prefetchObserver.observe(article);
       }
 
       const imgwrap = document.createElement('div');
@@ -595,7 +576,6 @@
       // 사라진(만료된) 이미지는 DOM에서 제거 + 대기열/배치 순서에서도 제거
       for (const [id, el] of cards) {
         if (!ids.has(id)) {
-          if (prefetchObserver) prefetchObserver.unobserve(el);
           el.remove();
           cards.delete(id);
         }
@@ -724,14 +704,33 @@
       } else { lastTap = now; lastCard = card; }
     });
 
+    let feedTimer = null, feedLoading = false, feedDelay = 5000;
     async function loadFeed() {
+      if (feedLoading) return;
+      clearTimeout(feedTimer);
+      if (document.hidden) { feedTimer = setTimeout(loadFeed, 5000); return; }
+      feedLoading = true;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
       try {
-        const res = await fetch('/feed?limit=200');
-        sync(await res.json());
+        const res = await fetch('/feed?limit=200', { cache: 'no-store', signal: controller.signal });
+        if (!res.ok) throw new Error('feed status ' + res.status);
+        const items = await res.json();
+        if (!Array.isArray(items)) throw new Error('invalid feed');
+        sync(items);
+        feedDelay = 5000;
       } catch (e) {
+        feedDelay = Math.min(60000, feedDelay * 2);
         console.error('feed load failed', e);
+      } finally {
+        clearTimeout(timeout);
+        feedLoading = false;
+        feedTimer = setTimeout(loadFeed, feedDelay);
       }
     }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && feedStarted) loadFeed();
+    });
 
     function scrollToTop() {
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -756,7 +755,6 @@
       if (feedStarted) return;
       feedStarted = true;
       loadFeed();
-      setInterval(loadFeed, 5000);
     }
 
     // Cloudflare Turnstile: Invisible 모드 — 쿠키가 유효하면 즉시 진입, 아니면 백그라운드 검증

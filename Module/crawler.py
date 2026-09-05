@@ -8,16 +8,17 @@ import requests
 from bs4 import BeautifulSoup, SoupStrainer
 from bs4.element import Tag
 
-from Module.config import BS_PARSER, HEADERS, REQUEST_TIMEOUT
+from Module.config import BS_PARSER, HEADERS
 from Module.delivery_archive import DeliveryArchive, post_key
 
 # BoundedSet 은 공통 LRUCache 로 통합됨 — 기존 import(arca_crawler/테스트) 호환 위해 재노출
 from Module.lru_cache import BoundedSet, LRUCache  # noqa: F401
+from Module.page_fetch import SourcePageGone, fetch_page
 from Module.retry_policy import (
     BlockedByChallenge,
     RetryPolicy,
-    request_with_policy,
 )
+from Module.url_policy import source_page
 
 logger = logging.getLogger(__name__)
 
@@ -71,17 +72,15 @@ class DCInsideCrawler:
     def get_latest_post(self) -> DCPost | None:
         """최신 게시글 정보 가져오기 (동기)"""
         try:
-            res = request_with_policy(
-                lambda: self.session.get(self.base_url, timeout=REQUEST_TIMEOUT),
-                self.retry_policy,
-            )
-            soup = BeautifulSoup(res.text, BS_PARSER, parse_only=_POST_ROW_STRAINER)
+            html = fetch_page(self.session, self.base_url, "dcinside", self.retry_policy)
+            soup = BeautifulSoup(html, BS_PARSER, parse_only=_POST_ROW_STRAINER)
 
             posts = soup.select("tr.ub-content")
             if not posts:
                 return None
 
             normal_post_count = 0
+            eligible = []
             for post in posts:
                 try:
                     if post.get("data-type") == "icon_notice":
@@ -94,7 +93,7 @@ class DCInsideCrawler:
                     link = urljoin("https://gall.dcinside.com", title_element.get("href", ""))
                     parts = urlsplit(link)
                     post_ids = parse_qs(parts.query).get("no", [])
-                    if parts.hostname != "gall.dcinside.com" or not post_ids:
+                    if not source_page(link, "dcinside") or not post_ids or not post_ids[0].isascii() or not post_ids[0].isdigit():
                         continue
 
                     normal_post_count += 1
@@ -105,30 +104,30 @@ class DCInsideCrawler:
                     title = title_element.text.strip()
                     image_insert = self.image_check(post)
 
-                    logger.debug(f"{title} {link} {image_insert}")
+                    logger.debug(f"[metadata omitted] [metadata omitted] {image_insert}")
 
                     if not self._has_sent(post_id):
-                        return {
+                        eligible.append({
                             'link': link,
                             'title': title,
                             'post_id': post_id,
                             'has_image': image_insert
-                        }
+                        })
 
                 except Exception as e:
-                    logger.warning(f"게시글 파싱 실패: {e}")
+                    logger.warning(f"게시글 파싱 실패: {type(e).__name__}")
                     continue
 
-            return None
+            return min(eligible, key=lambda item: int(item["post_id"])) if eligible else None
 
         except BlockedByChallenge:
             logger.warning("DCInside Cloudflare challenge 감지: %s", self.base_url)
             return None
         except requests.Timeout:
-            logger.warning(f"크롤링 타임아웃: {self.base_url}")
+            logger.warning("크롤링 타임아웃: [metadata omitted]")
             return None
-        except requests.RequestException as e:
-            logger.error(f"크롤링 요청 실패: {e}")
+        except (requests.RequestException, ValueError, SourcePageGone) as e:
+            logger.error(f"크롤링 요청 실패: {type(e).__name__}")
             return None
 
     def mark_sent(self, post_id: str) -> None:

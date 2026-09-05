@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -339,7 +340,7 @@ def test_verify_accepts_valid_string_token(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert "ts_ok=" in response.headers["set-cookie"]
-    siteverify.assert_called_once_with("turnstile-token", "203.0.113.8")
+    siteverify.assert_called_once_with("turnstile-token", "testclient")
 
 
 def test_turnstile_cookie_is_bound_to_client_ip(monkeypatch, tmp_path):
@@ -359,7 +360,7 @@ def test_client_ip_trusted_without_origin_secret(monkeypatch, tmp_path):
         headers = {"cf-connecting-ip": "203.0.113.9"}
         client = None
 
-    assert web_app._client_ip(_Req())  # type: ignore[arg-type] == "203.0.113.9"
+    assert web_app._client_ip(_Req()) == "unknown"
 
 
 def test_client_ip_requires_origin_secret_when_configured(monkeypatch, tmp_path):
@@ -372,9 +373,9 @@ def test_client_ip_requires_origin_secret_when_configured(monkeypatch, tmp_path)
             self.client = type("C", (), {"host": "10.0.0.5"})()
 
     # Spoofed header without the secret falls back to the socket peer.
-    assert web_app._client_ip(_Req())  # type: ignore[arg-type] == "10.0.0.5"
-    assert web_app._client_ip(_Req({"x-origin-secret": "wrong"}))  # type: ignore[arg-type] == "10.0.0.5"
-    assert web_app._client_ip(_Req({"x-origin-secret": "origin-secret"}))  # type: ignore[arg-type] == "203.0.113.9"
+    assert web_app._client_ip(_Req()) == "10.0.0.5"
+    assert web_app._client_ip(_Req({"x-origin-secret": "wrong"})) == "10.0.0.5"
+    assert web_app._client_ip(_Req({"x-origin-secret": "origin-secret"})) == "203.0.113.9"
 
 
 def test_static_pages_do_not_include_ad_network_hooks():
@@ -536,3 +537,94 @@ def test_oversized_static_image_is_recompressed_to_jpeg(monkeypatch, tmp_path):
     response = client.get(item["url"])
     assert response.headers["content-type"] == "image/jpeg"
     assert len(response.content) <= 16 * 1024
+
+
+def test_turnstile_cannot_be_bypassed_by_omitting_proxy_header(monkeypatch, tmp_path):
+    client, store = make_client(monkeypatch, tmp_path)
+    item = store.put(image_bytes(), "sample.png")
+    monkeypatch.setattr(web_app.app_config, "turnstile_secret", "secret")
+    assert client.get("/feed").status_code == 403
+    assert client.get(item["url"]).status_code == 403
+    assert client.post("/like/" + item["id"]).status_code == 403
+    assert not web_app._ts_cookie_valid("9999999999.악성", "127.0.0.1")
+
+
+def test_forged_ip_headers_share_rate_limit_without_origin_secret(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "web_origin_secret", "")
+    monkeypatch.setattr(web_app, "_FEED_RATE_MAX", 2)
+    assert client.get("/feed", headers={"cf-connecting-ip": "192.0.2.1"}).status_code == 200
+    assert client.get("/feed", headers={"cf-connecting-ip": "192.0.2.2"}).status_code == 200
+    assert client.get("/feed", headers={"cf-connecting-ip": "192.0.2.3"}).status_code == 429
+
+
+def test_rate_map_is_hard_bounded_under_many_new_clients():
+    import time
+    now = time.time()
+    bucket = {str(i): (1, now) for i in range(10000)}
+    assert web_app._rate_limited(bucket, "new", 60, 120)
+    assert len(bucket) == 10000
+
+
+def test_store_bounds_recent_hashes_and_counts_thumbnails():
+    store = make_store(max_items=2, thumb=16)
+    for i in range(20):
+        store.put(image_bytes(color=(i, i, i)), "x.png")
+    assert len(store._recent_hashes) <= 4
+    assert store.stats()["items"] == 2
+    assert store.stats()["memory_bytes"] == sum(
+        len(item.data) + len(item.thumbnail or b"") for item in store._items.values())
+
+
+@pytest.mark.asyncio
+async def test_ingest_rejects_overload_before_allocating_third_decode(monkeypatch, tmp_path):
+    import asyncio
+    import threading
+
+    import httpx
+    client, store = make_client(monkeypatch, tmp_path)
+    started = 0
+    lock, finish = threading.Lock(), threading.Event()
+    real_put = store.put
+    def blocking_put(*args):
+        nonlocal started
+        with lock:
+            started += 1
+        assert finish.wait(3)
+        return real_put(*args)
+    monkeypatch.setattr(store, "put", blocking_put)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://test",
+                                headers={"user-agent": "testclient"}) as http:
+        async def upload():
+            return await http.post("/internal/images", content=image_bytes(), headers={"X-Ingest-Token": "test-secret"})
+        tasks = [asyncio.create_task(upload()) for _ in range(2)]
+        try:
+            async with asyncio.timeout(2):
+                while started != 2:
+                    await asyncio.sleep(0.001)
+            assert (await upload()).status_code == 503
+            assert started == 2
+        finally:
+            finish.set()
+            results = await asyncio.gather(*tasks)
+        assert all(result.status_code == 200 for result in results)
+
+
+@pytest.mark.asyncio
+async def test_idle_ttl_sweeper_and_shutdown_clear_ram(monkeypatch, tmp_path):
+    import asyncio
+    now = [0.0]
+    store = make_store(clock=lambda: now[0], ttl=1)
+    client, _ = make_client(monkeypatch, tmp_path, store)
+    async with client.app.router.lifespan_context(client.app):
+        store.put(image_bytes(), "x.png")
+        now[0] = 1.0
+        await asyncio.sleep(1.1)
+        # Inspect raw storage: stats()/get() would themselves cause lazy eviction.
+        assert not store._items
+        assert store._bytes == 0
+        now[0] = 2.0
+        store.put(image_bytes(color="red"), "y.png")
+        assert store._items
+    assert not store._items
+    assert not store._recent_hashes

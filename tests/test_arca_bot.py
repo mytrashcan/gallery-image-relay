@@ -248,7 +248,7 @@ async def test_start_crawling_processes_posts(mock_dependencies, bot):
         {"title": "Post 1", "link": "https://arca.live/b/test/10", "post_id": "10"},
         {"title": "Post 2", "link": "https://arca.live/b/test/11", "post_id": "11"},
     ]
-    crawler_mock.get_latest_posts.side_effect = [posts, posts, posts]
+    crawler_mock.get_latest_posts.return_value = posts
 
     bot.process_post = AsyncMock()
 
@@ -273,7 +273,7 @@ async def test_download_single_image_success(mock_dependencies, bot):
     resp.iter_content.return_value = [resp.content]
     resp.raise_for_status.return_value = None
 
-    with patch("Module.arca_bot.requests.get", return_value=resp) as mock_get:
+    with patch("Module.arca_bot.requests.Session.get", return_value=resp) as mock_get:
         result = bot._download_single_image(
             MediaCandidate("https://ac-o.namu.la/1.jpg"),
             "https://arca.live/b/test/1",
@@ -286,6 +286,7 @@ async def test_download_single_image_success(mock_dependencies, bot):
         headers={"Referer": "https://arca.live/b/test/1"},
         timeout=15,
         stream=True,
+        allow_redirects=False,
     )
 
 
@@ -295,7 +296,7 @@ async def test_download_single_image_failure(mock_dependencies, bot):
     import requests
 
     with patch(
-        "Module.arca_bot.requests.get",
+        "Module.arca_bot.requests.Session.get",
         side_effect=requests.RequestException("timeout"),
     ):
         result = bot._download_single_image(
@@ -495,7 +496,7 @@ async def test_only_media_from_successful_arca_batch_are_hash_marked(
         "link": "https://arca.live/b/test/16",
     })
 
-    assert acknowledged is True
+    assert acknowledged is False
     assert bot._send_image_batch.await_count == 3
     # 성공 확정된 media(h1: 전체 성공, h2: PARTIAL fallback에서 전달됨)만 hash 표시.
     # h3는 FAILED로 전달되지 않았으므로 표시하지 않는다.
@@ -511,7 +512,10 @@ def test_download_client_returns_requests_module_without_proxy(monkeypatch):
     import requests as _requests
 
     monkeypatch.setattr("Module.arca_bot.app_config.arca_socks_proxy", "")
-    assert _make_download_client() is _requests
+    client = _make_download_client()
+    assert isinstance(client, _requests.Session)
+    assert client.proxies == {}
+    client.close()
 
 
 def test_download_client_applies_socks_proxy(monkeypatch):
@@ -526,3 +530,21 @@ def test_download_client_applies_socks_proxy(monkeypatch):
     assert isinstance(client, _requests.Session)
     assert client.proxies.get("https") == "socks5h://127.0.0.1:1080"
     assert client.proxies.get("http") == "socks5h://127.0.0.1:1080"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_gather_releases_prepared_sibling_hash(bot):
+    prepared = asyncio.Event()
+    async def prepare(candidate, link):
+        if candidate == "first":
+            prepared.set()
+            return MediaPreparation(prepared_media("x.jpg", "reserved"), True)
+        await asyncio.Event().wait()
+    bot._download_and_process_one = prepare
+    task = asyncio.create_task(bot._download_and_process(["first", "second"], ""))
+    await prepared.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    bot.image_handler.release_hash.assert_called_once_with("reserved")

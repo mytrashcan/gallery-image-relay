@@ -24,6 +24,14 @@ from Module.retry_policy import RetryPolicy
 class FakeResponse:
     def __init__(self, text: object) -> None:
         self.text = text
+        self.headers = {}
+        self.status_code = 200
+
+    def iter_content(self, chunk_size):
+        yield self.text.encode()
+
+    def close(self):
+        pass
 
     def raise_for_status(self) -> object:
         pass
@@ -326,6 +334,7 @@ def test_get_latest_posts_reports_cloudflare_challenge_without_retry() -> None:
         "<html><title>Just a moment...</title>"
         "<script src='/cdn-cgi/challenge-platform/x'></script></html>"
     )
+    response.iter_content.return_value = [response.text.encode()]
     session = MagicMock()
     session.get.return_value = response
     crawler = ArcaliveCrawler(

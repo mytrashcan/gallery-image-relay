@@ -9,7 +9,7 @@ from Module.gallery_client import GalleryClient, attach_web_gallery
 
 
 def test_publish_sends_bytes_to_authenticated_internal_endpoint(monkeypatch):
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.json.return_value = {"id": "abc.jpg"}
     post = MagicMock(return_value=response)
     client = GalleryClient("http://127.0.0.1:8000", "secret")
@@ -32,7 +32,7 @@ def test_publish_sends_bytes_to_authenticated_internal_endpoint(monkeypatch):
 
 
 def test_publish_retries_when_web_process_is_starting(monkeypatch):
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.json.return_value = {"id": "abc.jpg"}
     post = MagicMock(side_effect=[requests.ConnectionError("not ready"), response])
     sleep = MagicMock()
@@ -46,7 +46,7 @@ def test_publish_retries_when_web_process_is_starting(monkeypatch):
 
 
 def test_publish_failure_log_does_not_include_image_metadata(monkeypatch, caplog):
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.status_code = 401
     error = requests.HTTPError(
         "401 for http://127.0.0.1/internal/images?title=private-title&link=private-link",
@@ -92,7 +92,7 @@ def test_publish_does_not_retry_permanent_client_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_publish_async_uses_async_sleep_between_attempts(monkeypatch):
-    response = MagicMock()
+    response = MagicMock(status_code=200)
     response.json.return_value = {"id": "abc.jpg"}
     client = GalleryClient(
         "http://127.0.0.1:8000",

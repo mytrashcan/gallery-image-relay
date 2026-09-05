@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 
 import requests
 
 from Module.config import app_config
+from Module.lifecycle import run_blocking
 from Module.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -52,6 +52,7 @@ class GalleryClient:
         self.max_attempts = self.retry_policy.max_attempts
         self.retry_delay_seconds = self.retry_policy.base_delay
         self.session = requests.Session()
+        self.session.trust_env = False
 
     def _publish_once(
         self,
@@ -76,9 +77,12 @@ class GalleryClient:
                 "Content-Type": "application/octet-stream",
             },
             timeout=10,
+            allow_redirects=False,
         )
         try:
             raise_for_cloudflare_challenge(response)
+            if 300 <= response.status_code < 400:
+                raise requests.HTTPError("ingest redirect rejected", response=response)
             response.raise_for_status()
             return response.json()
         finally:
@@ -162,7 +166,7 @@ class GalleryClient:
             if attempt == 1 and self.retry_policy.request_interval > 0:
                 await sleep_async(self.retry_policy.request_interval)
             try:
-                return await asyncio.to_thread(
+                return await run_blocking(
                     self._publish_once,
                     data,
                     filename,

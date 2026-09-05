@@ -30,10 +30,17 @@ class DeliveryResult:
 
     @property
     def acknowledged(self) -> bool:
-        return any(
-            delivery.ack_eligible and delivery.outcome is DeliveryOutcome.SUCCEEDED
-            for delivery in self.deliveries
+        eligible = [delivery for delivery in self.deliveries if delivery.ack_eligible]
+        return bool(eligible) and all(
+            delivery.outcome is DeliveryOutcome.SUCCEEDED for delivery in eligible
         )
+
+    def media_acknowledged(self, media_id: str) -> bool:
+        eligible = [
+            d for d in self.deliveries
+            if d.ack_eligible and media_id in d.requested_media
+        ]
+        return bool(eligible) and all(media_id in d.delivered_media for d in eligible)
 
     def merge(self, *others: DeliveryResult) -> DeliveryResult:
         return DeliveryResult(

@@ -6,9 +6,11 @@ from io import BytesIO
 
 import discord
 
+from Module.delivery_archive import DeliveryArchive, destination_key
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
 from Module.embeds import make_image_embed
 from Module.gallery_client import GalleryClient
+from Module.lru_cache import LRUCache
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,9 @@ class MediaPipeline:
         telegram_enabled: bool = True,
         source_label: str = "아카라이브",
         web_publish_requires_discord_success: bool = False,
+        delivery_archive: DeliveryArchive | None = None,
+        source: str = "",
+        gallery_name: str = "",
     ):
         self.message_sender = message_sender
         self.client = client
@@ -51,6 +56,30 @@ class MediaPipeline:
         self.gallery_client = GalleryClient() if web_gallery_enabled else None
         self._web_queue: asyncio.Queue | None = None
         self._web_worker_task: asyncio.Task | None = None
+        self._web_pending_bytes = 0
+        self._closed = False
+        self.delivery_archive = delivery_archive
+        self.source = source
+        self.gallery_name = gallery_name
+        self._receipts = LRUCache(2000)
+
+    def _delivered(self, transport: str, destination: str, media_id: str) -> bool:
+        key = destination_key(transport, destination, media_id)
+        if key in self._receipts:
+            return True
+        return self.delivery_archive is not None and self.delivery_archive.check(self.source, self.gallery_name, key)
+
+    def _record(self, delivery: ChannelDelivery) -> None:
+        logger.info(
+            "delivery source=%s gallery=%s transport=%s destination=%s outcome=%s delivered=%s requested=%s",
+            self.source, self.gallery_name, delivery.transport, delivery.destination_id,
+            delivery.outcome.value, len(delivery.delivered_media), len(delivery.requested_media),
+        )
+        keys = [destination_key(delivery.transport, delivery.destination_id, m) for m in delivery.delivered_media]
+        if keys and self.delivery_archive is not None:
+            self.delivery_archive.add_many(self.source, self.gallery_name, keys)
+        for key in keys:
+            self._receipts.add(key)
 
     def _ensure_web_worker(self) -> None:
         if self.gallery_client is None or self._web_worker_task is not None:
@@ -69,7 +98,9 @@ class MediaPipeline:
             except Exception as exc:
                 logger.warning("웹 갤러리 백그라운드 전송 실패: %s", type(exc).__name__)
             finally:
+                self._web_pending_bytes -= len(args[0][0])
                 self._web_queue.task_done()
+                del args
 
     def _get_channel(self, channel_id, *, warn_missing: bool = False):
         channel = self.client.get_channel(int(channel_id))
@@ -105,7 +136,7 @@ class MediaPipeline:
                     reason="gallery_disabled",
                 ),
             ))
-        if not data:
+        if not data or self._closed:
             return DeliveryResult((
                 ChannelDelivery(
                     transport="web_gallery",
@@ -128,7 +159,13 @@ class MediaPipeline:
             },
         )
         try:
+            from Module.config import app_config
+            # Includes the in-flight request, not just queued entries.
+            if (len(data) > app_config.web_ingest_max_mb * 1024 * 1024
+                    or self._web_pending_bytes + len(data) > app_config.web_upload_queue_max_mb * 1024 * 1024):
+                raise asyncio.QueueFull
             self._web_queue.put_nowait(payload)
+            self._web_pending_bytes += len(data)
             return DeliveryResult((
                 ChannelDelivery(
                     transport="web_gallery",
@@ -140,7 +177,7 @@ class MediaPipeline:
                 ),
             ))
         except asyncio.QueueFull:
-            logger.warning("웹 갤러리 큐가 가득 차 이미지를 건너뜁니다: %s", filename)
+            logger.warning("Web gallery queue capacity exceeded")
             return DeliveryResult((
                 ChannelDelivery(
                     transport="web_gallery",
@@ -233,11 +270,21 @@ class MediaPipeline:
     ) -> DeliveryResult:
         """한 이미지 batch를 모든 Discord 채널로 fan-out한다."""
         batch = list(items)
+        if not batch:
+            return DeliveryResult(())
         requested_media = self._media_ids(batch)
 
         result = DeliveryResult(())
         for channel_id in self.channel_ids:
             destination_id = str(channel_id)
+            already = tuple(m for m in requested_media if self._delivered("discord", destination_id, m))
+            pending = [item for item, m in zip(batch, requested_media, strict=True) if m not in already]
+            if not pending:
+                result = result.merge(DeliveryResult((ChannelDelivery(
+                    "discord", destination_id, DeliveryOutcome.SUCCEEDED,
+                    requested_media, requested_media, True,
+                ),)))
+                continue
             channel = self._get_channel(channel_id, warn_missing=True)
             if not channel:
                 result = result.merge(DeliveryResult((
@@ -246,7 +293,7 @@ class MediaPipeline:
                         destination_id=destination_id,
                         outcome=DeliveryOutcome.FAILED,
                         requested_media=requested_media,
-                        delivered_media=(),
+                        delivered_media=already,
                         ack_eligible=True,
                         reason="channel_not_found",
                     ),
@@ -254,18 +301,27 @@ class MediaPipeline:
                 continue
 
             files, embeds = self._build_discord_payload(
-                batch,
+                pending,
                 title=title,
                 link=link,
                 start_index=start_index,
             )
             channel_delivery = await self.message_sender.send_discord_payload(
                 channel,
-                batch,
+                pending,
                 files=files,
                 embeds=embeds,
                 destination_id=destination_id,
-                requested_media=requested_media,
+                requested_media=self._media_ids(pending),
+                on_delivered=self._record,
+            )
+            self._record(channel_delivery)
+            delivered = tuple(m for m in requested_media if m in already or m in channel_delivery.delivered_media)
+            channel_delivery = ChannelDelivery(
+                "discord", destination_id,
+                DeliveryOutcome.SUCCEEDED if len(delivered) == len(requested_media) else (
+                    DeliveryOutcome.PARTIAL if delivered else DeliveryOutcome.FAILED
+                ), requested_media, delivered, True, channel_delivery.reason,
             )
             result = result.merge(DeliveryResult((channel_delivery,)))
 
@@ -325,15 +381,16 @@ class MediaPipeline:
             result = result.merge(discord_result)
 
             if self.telegram_enabled:
-                telegram_sent = await self.message_sender.send_to_telegram(
-                    telegram_buffer,
-                    filename,
-                    is_gif,
-                    validated=image_item.validated,
-                )
-                telegram_chat_id = getattr(self.message_sender, "telegram_chat_id", "")
-                result = result.merge(DeliveryResult((
-                    ChannelDelivery(
+                telegram_chat_id = str(getattr(self.message_sender, "telegram_chat_id", "") or "")
+                telegram_sent = self._delivered("telegram", telegram_chat_id, requested_media[0])
+                if not telegram_sent:
+                    telegram_sent = await self.message_sender.send_to_telegram(
+                        telegram_buffer,
+                        filename,
+                        is_gif,
+                        validated=image_item.validated,
+                    )
+                telegram_delivery = ChannelDelivery(
                         transport="telegram",
                         destination_id=str(telegram_chat_id or ""),
                         outcome=DeliveryOutcome.SUCCEEDED if telegram_sent else DeliveryOutcome.FAILED,
@@ -341,8 +398,9 @@ class MediaPipeline:
                         delivered_media=requested_media if telegram_sent else (),
                         ack_eligible=True,
                         reason=None if telegram_sent else "send_failed",
-                    ),
-                )))
+                    )
+                self._record(telegram_delivery)
+                result = result.merge(DeliveryResult((telegram_delivery,)))
 
             if self.web_gallery_enabled:
                 base_title = gallery_title if gallery_title is not None else title
@@ -362,6 +420,7 @@ class MediaPipeline:
         return result
 
     async def close(self) -> None:
+        self._closed = True
         if self._web_queue is not None:
             try:
                 await asyncio.wait_for(self._web_queue.join(), timeout=5)
@@ -370,5 +429,10 @@ class MediaPipeline:
         if self._web_worker_task is not None:
             self._web_worker_task.cancel()
             await asyncio.gather(self._web_worker_task, return_exceptions=True)
+        if self._web_queue is not None:
+            while not self._web_queue.empty():
+                payload = self._web_queue.get_nowait()
+                self._web_pending_bytes -= len(payload[0][0])
+                self._web_queue.task_done()
         if self.gallery_client is not None:
             self.gallery_client.close()

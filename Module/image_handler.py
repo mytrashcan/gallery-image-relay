@@ -22,6 +22,8 @@ from Module.media_download import (
     ensure_image_extension,
     image_extension_from_data,
 )
+from Module.page_fetch import SourcePageGone, fetch_page
+from Module.url_policy import https_host
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,7 @@ class ImageHandler:
 
     def compress_gif(self, image_data: object, target_size: object, filename: object) -> object:
         """GIF 압축 (프레임 수 줄이기 + 크기 조절)"""
+        self.validate_image_data(image_data)
         try:
             original_size = len(image_data)
             buffer = io.BytesIO(image_data)
@@ -130,7 +133,9 @@ class ImageHandler:
             for frame_index in range(frame_count):
                 img.seek(frame_index)
                 if frame_index % step == 0:
-                    frames.append(img.copy())
+                    frame = img.copy()
+                    frame.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                    frames.append(frame)
                     durations.append(0)
                 # Multiplying a sampled frame's duration by ``step`` assumes
                 # uniform timing and skews variable-duration animations. Sum
@@ -159,19 +164,20 @@ class ImageHandler:
                 )
 
                 if output.tell() <= target_size:
+                    size = output.tell()
                     output.seek(0)
-                    logger.info(f"[GIF 압축] {filename}: {original_size} -> {output.tell()} bytes (scale: {scale:.1f})")
-                    return output, output.tell()
+                    logger.info(f"[GIF 압축] [metadata omitted]: {original_size} -> {output.tell()} bytes (scale: {scale:.1f})")
+                    return output, size
 
                 scale -= 0.1
 
-            logger.warning(f"[GIF 압축 실패] {filename}: 목표 크기 달성 불가")
+            logger.warning("[GIF 압축 실패] [metadata omitted]: 목표 크기 달성 불가")
             buffer.seek(0)
             return buffer, original_size
 
         except (OSError, ValueError) as e:
             # PIL 디코딩/저장 오류는 대부분 OSError(UnidentifiedImageError 포함)·ValueError
-            logger.error(f"[GIF 압축 에러] {filename}: {e}")
+            logger.error(f"[GIF 압축 에러] [metadata omitted]: {type(e).__name__}")
             buffer = io.BytesIO(image_data)
             return buffer, len(image_data)
 
@@ -220,9 +226,10 @@ class ImageHandler:
                 resized.save(output, format='JPEG', quality=70, optimize=True)
 
                 if output.tell() <= target_size:
+                    size = output.tell()
                     output.seek(0)
-                    logger.info(f"[이미지 압축] {filename}: {original_size} -> {output.tell()} bytes (scale: {scale:.1f})")
-                    return output, output.tell()
+                    logger.info(f"[이미지 압축] [metadata omitted]: {original_size} -> {output.tell()} bytes (scale: {scale:.1f})")
+                    return output, size
 
                 scale -= 0.15
 
@@ -230,7 +237,7 @@ class ImageHandler:
             return buffer, original_size
 
         except (OSError, ValueError) as e:
-            logger.error(f"[이미지 압축 에러] {filename}: {e}")
+            logger.error(f"[이미지 압축 에러] [metadata omitted]: {type(e).__name__}")
             buffer = io.BytesIO(image_data)
             return buffer, len(image_data)
 
@@ -250,7 +257,7 @@ class ImageHandler:
             else:
                 discord_buffer, discord_size = self.compress_image(image_data, DISCORD_MAX_SIZE, filename)
             discord_compressed = True
-            logger.info(f"[Discord 압축] {filename}: {original_size:,} -> {discord_size:,} bytes ({(1 - discord_size / original_size) * 100:.1f}% 감소)")
+            logger.info(f"[Discord 압축] [metadata omitted]: {original_size:,} -> {discord_size:,} bytes ({(1 - discord_size / original_size) * 100:.1f}% 감소)")
         else:
             discord_buffer = io.BytesIO(image_data)
             discord_size = original_size
@@ -267,12 +274,12 @@ class ImageHandler:
             else:
                 telegram_buffer, telegram_size = self.compress_image(image_data, TELEGRAM_MAX_SIZE, filename)
             telegram_compressed = True
-            logger.info(f"[Telegram 압축] {filename}: {original_size:,} -> {telegram_size:,} bytes ({(1 - telegram_size / original_size) * 100:.1f}% 감소)")
+            logger.info(f"[Telegram 압축] [metadata omitted]: {original_size:,} -> {telegram_size:,} bytes ({(1 - telegram_size / original_size) * 100:.1f}% 감소)")
         else:
             telegram_buffer = io.BytesIO(image_data)
 
         if not discord_compressed and not telegram_compressed:
-            logger.debug(f"[압축 불필요] {filename}: {original_size:,} bytes (제한 이내)")
+            logger.debug(f"[압축 불필요] [metadata omitted]: {original_size:,} bytes (제한 이내)")
 
         discord_buffer.seek(0)
         telegram_buffer.seek(0)
@@ -292,21 +299,35 @@ class ImageHandler:
                 width, height = image.size
                 if width <= 0 or height <= 0 or width * height > app_config.media_max_pixels:
                     raise ValueError("image dimensions exceed safety limit")
+                if getattr(image, "is_animated", False):
+                    total_pixels = 0
+                    for index in range(app_config.media_max_frames + 1):
+                        try:
+                            image.seek(index)
+                        except EOFError:
+                            break
+                        width, height = image.size
+                        total_pixels += width * height
+                        if (index == app_config.media_max_frames
+                            or width * height > app_config.media_max_pixels
+                            or total_pixels > app_config.media_max_animation_pixels):
+                            raise ValueError("animation exceeds frame/pixel budget")
+                    return
                 image.verify()
         except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
             raise ValueError("invalid image data") from exc
 
     @staticmethod
     def _is_allowed_dc_image_url(url: str) -> bool:
-        parts = urlsplit(url)
-        hostname = (parts.hostname or "").lower()
-        host_label = hostname.split(".", 1)[0]
         try:
+            parts = urlsplit(url)
+            hostname = (parts.hostname or "").lower()
+            host_label = hostname.split(".", 1)[0]
             has_custom_port = parts.port is not None
-        except ValueError:
+        except (ValueError, TypeError):
             return False
         return (
-            parts.scheme == "https"
+            https_host(url, {hostname})
             and parts.username is None
             and parts.password is None
             and not has_custom_port
@@ -363,9 +384,11 @@ class ImageHandler:
         try:
             post_url = str(url)
             headers = {"Referer": post_url}
-            res = self.session.get(post_url, headers=headers, timeout=REQUEST_TIMEOUT)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, BS_PARSER)
+            html = fetch_page(self.session, post_url, "dcinside")
+            soup = BeautifulSoup(html, BS_PARSER)
+            if soup.select_one(".writing_view_box, .write_div, div.appending_file_box") is None:
+                logger.warning("DC detail parser did not find post body")
+                return None
 
             attachment_links = soup.select("div.appending_file_box ul li a[href]")
             image_elements = [
@@ -391,7 +414,7 @@ class ImageHandler:
                 )
 
                 if self.has_seen_hash(verified.content_hash):
-                    logger.info(f"동일한 파일이 존재합니다. PASS: {verified.filename}")
+                    logger.info("동일한 파일이 존재합니다. PASS: [metadata omitted]")
                     return []
 
                 discord_buffer, telegram_buffer, is_gif = self.process_image(
@@ -400,8 +423,7 @@ class ImageHandler:
                 )
 
                 logger.info(
-                    "[메모리 버퍼] 파일명: %s, 원본 크기: %s bytes, GIF: %s",
-                    verified.filename,
+                    "[메모리 버퍼] 원본 크기: %s bytes, GIF: %s",
                     len(verified.data),
                     is_gif,
                 )
@@ -415,13 +437,15 @@ class ImageHandler:
                     verified.content_hash,
                 )]
 
-            return None
+            return []
 
+        except SourcePageGone:
+            return []
         except requests.Timeout:
-            logger.warning(f"이미지 다운로드 타임아웃: {url}")
+            logger.warning("이미지 다운로드 타임아웃: [metadata omitted]")
             return None
         except requests.RequestException as e:
-            logger.error(f"이미지 다운로드 실패: {e}")
+            logger.error(f"이미지 다운로드 실패: {type(e).__name__}")
             return None
         except MediaDownloadRejected as exc:
             logger.warning("이미지가 영구적으로 거절되어 건너뜁니다: %s", type(exc).__name__)
