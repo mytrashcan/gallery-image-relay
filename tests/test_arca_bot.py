@@ -248,7 +248,7 @@ async def test_start_crawling_processes_posts(mock_dependencies, bot):
         {"title": "Post 1", "link": "https://arca.live/b/test/10", "post_id": "10"},
         {"title": "Post 2", "link": "https://arca.live/b/test/11", "post_id": "11"},
     ]
-    crawler_mock.get_latest_posts.side_effect = [posts, posts, posts]
+    crawler_mock.get_latest_posts.return_value = posts
 
     bot.process_post = AsyncMock()
 

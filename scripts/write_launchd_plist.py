@@ -6,6 +6,11 @@ from pathlib import Path
 
 
 def write_plist(path, label, root, log, args, environment):
+    """Write to an operator-selected CLI destination, never an HTTP input.
+
+    dcselfie.sh supplies a fixed service label under ~/Library/LaunchAgents.
+    Absolute destinations outside the checkout are intentional.
+    """
     payload = {"Label": label, "ProgramArguments": args, "EnvironmentVariables": environment,
                "WorkingDirectory": root, "RunAtLoad": True, "KeepAlive": True,
                "ThrottleInterval": 30, "ExitTimeOut": 110, "Umask": 0o077,

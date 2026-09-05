@@ -6,7 +6,15 @@ import signal
 
 
 async def run_blocking(function, /, *args, **kwargs):
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    def invoke():
+        try:
+            return function(*args, **kwargs)
+        except StopIteration as exc:
+            # Python 3.11 cannot transfer StopIteration into an asyncio Future;
+            # the worker finishes but its Future (and cancellation join) hangs.
+            raise RuntimeError("blocking callable raised StopIteration") from exc
+
+    task = asyncio.create_task(asyncio.to_thread(invoke))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:

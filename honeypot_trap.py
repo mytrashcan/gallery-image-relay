@@ -195,6 +195,8 @@ class HoneypotRecorder:
     """Append honeypot interactions to a process-local, thread-safe JSONL log."""
 
     def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
+        # Trusted operator configuration only. Request paths are JSON fields in
+        # record(), never filesystem destinations (including during rotation).
         configured_path = path or os.environ.get("HONEYPOT_LOG_PATH")
         self.path = Path(configured_path) if configured_path else None
         self.events = deque(maxlen=1000)

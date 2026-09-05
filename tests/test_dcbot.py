@@ -197,7 +197,7 @@ async def test_start_crawling_processes_post_with_image(mock_dependencies, bot):
         "post_id": "3",
         "has_image": True,
     }
-    crawler_mock.get_latest_post.side_effect = [post, post, post]
+    crawler_mock.get_latest_post.return_value = post
 
     image_handler_mock.download_images.return_value = [
         (io.BytesIO(b"discord"), io.BytesIO(b"telegram"), "img.png", False, b"original", "hash"),
