@@ -230,6 +230,9 @@ except ImportError:
     BS_PARSER = "html.parser"
 
 # 헤더 설정
+# Accept-Encoding is deliberately omitted: requests advertises only encodings urllib3
+# can decode here (br only when a Brotli decoder is installed). A hard-coded "br"
+# without a decoder would hand compressed bytes to the HTML parser.
 HEADERS = {
     "Connection": "keep-alive",
     "Cache-Control": "max-age=0",
@@ -242,7 +245,6 @@ HEADERS = {
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-User": "?1",
     "Sec-Fetch-Dest": "document",
-    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
