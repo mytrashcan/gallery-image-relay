@@ -102,6 +102,33 @@ def test_monitor_batch_restarts_only_crashed_process(monkeypatch):
     launcher.processes.clear()
 
 
+def crash_after(monkeypatch, uptime: float, previous_failures: int) -> launcher.CrawlerProcessState:
+    crashed = MagicMock()
+    crashed.poll.return_value = 1
+    launcher.processes.clear()
+    launcher.processes["dc"] = launcher.CrawlerProcessState(crashed, 1000.0, None, previous_failures)
+    monkeypatch.setattr("launcher.time.monotonic", lambda: 5000.0)
+    monkeypatch.setattr("launcher.time.time", lambda: 1000.0 + uptime)
+    launcher.monitor_batch({"dc"})
+    state = launcher.processes["dc"]
+    launcher.processes.clear()
+    return state
+
+
+def test_crash_after_stable_uptime_restarts_with_fresh_backoff(monkeypatch):
+    state = crash_after(monkeypatch, uptime=launcher.STABLE_UPTIME_SECONDS, previous_failures=6)
+
+    assert state.failures == 1
+    assert state.restart_at == 5000.0 + launcher._restart_delay(1)
+
+
+def test_repeated_quick_crashes_keep_growing_backoff(monkeypatch):
+    state = crash_after(monkeypatch, uptime=launcher.STABLE_UPTIME_SECONDS - 1, previous_failures=3)
+
+    assert state.failures == 4
+    assert state.restart_at == 5000.0 + launcher._restart_delay(4)
+
+
 def test_monitor_batch_reschedules_when_restart_spawn_fails(monkeypatch):
     launcher.processes.clear()
     launcher.processes["dc"] = launcher.CrawlerProcessState(None, None, 99.0, 1)

@@ -27,6 +27,9 @@ from Module.url_policy import https_host
 
 logger = logging.getLogger(__name__)
 
+# verify() does not read pixel data for these formats, so a truncated file passes it.
+_DECODE_CHECK_FORMATS = frozenset({"JPEG", "GIF", "BMP"})
+
 # Telegram: 10MB (photo), 50MB (document)
 # Discord 제한은 서버 부스트 레벨에 따라 다르므로 config.DISCORD_MAX_SIZE(.env로 조정 가능) 사용
 TELEGRAM_MAX_SIZE = 10 * 1024 * 1024
@@ -313,7 +316,14 @@ class ImageHandler:
                             or total_pixels > app_config.media_max_animation_pixels):
                             raise ValueError("animation exceeds frame/pixel budget")
                     return
+                image_format = image.format
                 image.verify()
+            if image_format in _DECODE_CHECK_FORMATS:
+                with Image.open(io.BytesIO(image_data)) as decoded:
+                    # JPEG decodes at 1/8 scale here, which still reads every scan;
+                    # draft() is a no-op for GIF and BMP.
+                    decoded.draft(decoded.mode, (max(1, width // 8), max(1, height // 8)))
+                    decoded.load()
         except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
             raise ValueError("invalid image data") from exc
 

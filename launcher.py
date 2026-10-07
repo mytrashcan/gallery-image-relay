@@ -14,7 +14,7 @@ from urllib import error, request
 
 import psutil
 
-from Module.config import PROJECT_ROOT, app_config, load_gallery_configs
+from Module.config import PROJECT_ROOT, app_config, env_int, load_gallery_configs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,10 +42,12 @@ class CrawlerProcessState:
 
 processes: dict[str, CrawlerProcessState] = {}
 
-MAX_DC = min(5, max(1, int(os.getenv("MAX_DC_CRAWLERS", "5"))))
-MAX_ARCA = min(5, max(1, int(os.getenv("MAX_ARCA_CRAWLERS", "5"))))
-BATCH_LIFETIME = max(60, int(os.getenv("CRAWLER_BATCH_SECONDS", "3600")))
+MAX_DC = min(5, max(1, env_int("MAX_DC_CRAWLERS", 5)))
+MAX_ARCA = min(5, max(1, env_int("MAX_ARCA_CRAWLERS", 5)))
+BATCH_LIFETIME = max(60, env_int("CRAWLER_BATCH_SECONDS", 3600))
 RESTART_BACKOFF_MAX = 60
+# A crawler that ran at least this long before exiting restarts with a fresh backoff.
+STABLE_UPTIME_SECONDS = 600
 
 shutdown_requested = False
 
@@ -78,7 +80,7 @@ def wait_for_web_gallery() -> bool:
 
     base_url = os.getenv("WEB_GALLERY_URL", "http://127.0.0.1:8000").rstrip("/")
     try:
-        timeout_seconds = max(1, int(os.getenv("WEB_READY_TIMEOUT_SECONDS", "60")))
+        timeout_seconds = max(1, env_int("WEB_READY_TIMEOUT_SECONDS", 60))
     except ValueError:
         timeout_seconds = 60
         logger.warning("WEB_READY_TIMEOUT_SECONDS 값이 올바르지 않아 60초를 사용합니다.")
@@ -260,14 +262,15 @@ def monitor_batch(expected_galleries: set[str]) -> None:
         return_code = process.poll()
         if return_code is None:
             continue
-        failures = state.failures + 1
-        delay = _restart_delay(failures)
         started_at = state.started_at if state.started_at is not None else time.time()
+        uptime = max(0.0, time.time() - started_at)
+        failures = 1 if uptime >= STABLE_UPTIME_SECONDS else state.failures + 1
+        delay = _restart_delay(failures)
         logger.warning(
             "%s 크롤러 종료(code=%s, uptime=%.1fs). %.1f초 후 재시작합니다.",
             gallery_name,
             return_code,
-            max(0.0, time.time() - started_at),
+            uptime,
             delay,
         )
         processes[gallery_name] = CrawlerProcessState(
