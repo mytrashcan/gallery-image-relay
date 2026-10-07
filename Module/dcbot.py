@@ -103,7 +103,7 @@ class DCBot(discord.Client):
                         self.crawler.mark_failed(post["post_id"])
                         raise
                     if delivered:
-                        self.crawler.mark_sent(post["post_id"])
+                        await run_blocking(self.crawler.mark_sent, post["post_id"])
                     else:
                         self.crawler.mark_failed(post["post_id"])
             except discord.ConnectionClosed:
@@ -143,7 +143,7 @@ class DCBot(discord.Client):
         )
         for item in media_items:
             if delivery_result.media_acknowledged(item.content_hash):
-                self.image_handler.mark_hash_sent(item.content_hash)
+                await run_blocking(self.image_handler.mark_hash_sent, item.content_hash)
         return delivery_result.acknowledged
 
     async def on_message(self, message: discord.Message) -> None:

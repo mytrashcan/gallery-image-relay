@@ -60,22 +60,22 @@ class ImageHandler:
                 "source and gallery_name are required when using a delivery archive"
             )
 
-    def has_seen_hash(self, content_hash: str) -> bool:
-        with self._hash_lock:
-            return self._has_seen_hash_locked(content_hash)
+    # SQLite calls stay outside _hash_lock: the event loop takes this lock (release,
+    # reserve_pending_hash), and a write can wait up to the archive's busy timeout.
 
-    def _has_seen_hash_locked(self, content_hash: str) -> bool:
-        if content_hash in self._seen_hashes:
-            return True
-        if self.delivery_archive is None:
-            return False
-        if not self.delivery_archive.check(
+    def has_seen_hash(self, content_hash: str) -> bool:
+        """May query the archive; call it from a worker thread, not the event loop."""
+        with self._hash_lock:
+            if content_hash in self._seen_hashes:
+                return True
+        if self.delivery_archive is None or not self.delivery_archive.check(
             self.source,
             self.gallery_name,
             image_key(content_hash),
         ):
             return False
-        self._seen_hashes.add(content_hash)
+        with self._hash_lock:
+            self._seen_hashes.add(content_hash)
         return True
 
     def reserve_hash(self, content_hash: str) -> bool:
@@ -84,11 +84,14 @@ class ImageHandler:
         이미 기록된(또는 다른 스레드가 선점 중인) 해시면 False를 반환하고,
         처음 보는 해시면 예약하고 True를 반환한다. 예약은 전송 성공 시
         mark_hash_sent로 확정되고, 실패 시 release_hash로 롤백된다.
+        아카이브를 조회할 수 있으므로 이벤트 루프가 아닌 작업 스레드에서 호출한다.
         """
+        return not self.has_seen_hash(content_hash) and self.reserve_pending_hash(content_hash)
+
+    def reserve_pending_hash(self, content_hash: str) -> bool:
+        """Memory-only reservation for a caller that already checked has_seen_hash."""
         with self._hash_lock:
-            if self._has_seen_hash_locked(content_hash):
-                return False
-            if content_hash in self._pending_hashes:
+            if content_hash in self._seen_hashes or content_hash in self._pending_hashes:
                 return False
             self._pending_hashes.add(content_hash)
             return True
@@ -99,14 +102,15 @@ class ImageHandler:
             self._pending_hashes.discard(content_hash)
 
     def mark_hash_sent(self, content_hash: str) -> None:
+        """Writes to the archive; call it from a worker thread, not the event loop."""
+        if self.delivery_archive is not None:
+            self.delivery_archive.add(
+                self.source,
+                self.gallery_name,
+                image_key(content_hash),
+            )
         with self._hash_lock:
             self._pending_hashes.discard(content_hash)
-            if self.delivery_archive is not None:
-                self.delivery_archive.add(
-                    self.source,
-                    self.gallery_name,
-                    image_key(content_hash),
-                )
             self._seen_hashes.add(content_hash)
 
     def clear_seen_hashes(self) -> object:

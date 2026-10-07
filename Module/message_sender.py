@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from io import BytesIO
 
 import discord
@@ -215,7 +215,7 @@ class MessageSender:
         embeds: list[discord.Embed],
         destination_id: str,
         requested_media: tuple[str, ...],
-        on_delivered: Callable[[ChannelDelivery], None] | None = None,
+        on_delivered: Callable[[ChannelDelivery], Awaitable[None]] | None = None,
     ) -> ChannelDelivery:
         """한 Discord 채널에 payload를 전송하고 413이면 항목별로 fallback한다."""
         if (
@@ -273,9 +273,10 @@ class MessageSender:
             if sent:
                 delivered_media.append(media_id)
                 if on_delivered is not None:
-                    # Persist before the next await: later fallback items can be
-                    # cancelled or fail without forgetting this confirmed send.
-                    on_delivered(self._discord_delivery(destination_id, (media_id,), (media_id,)))
+                    # Persist before the next item is sent: later fallback items can be
+                    # cancelled or fail without forgetting this confirmed send. The
+                    # callback completes its write even if this task is cancelled.
+                    await on_delivered(self._discord_delivery(destination_id, (media_id,), (media_id,)))
             if len(items) > 1:
                 await asyncio.sleep(0.5)
 
