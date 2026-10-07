@@ -45,6 +45,26 @@ def test_backoff_doubles_and_is_capped() -> None:
     assert delays == [60, 120, 240, 300, 300]
 
 
+def test_backoff_stays_capped_after_many_failures() -> None:
+    schedule = make_schedule(FakeClock())
+
+    for _ in range(2000):
+        state = schedule.record_failure("1")
+
+    assert state.attempts == 2000
+    assert state.delay == 300
+
+
+def test_empty_schedule_passed_to_crawlers_is_kept() -> None:
+    from Module.arca_crawler import ArcaliveCrawler
+    from Module.crawler import DCInsideCrawler
+
+    schedule = PostRetrySchedule(base_delay=5, max_delay=10)
+
+    assert DCInsideCrawler("https://gall.dcinside.com/mgallery/board/lists/?id=t", post_retry=schedule).post_retry is schedule
+    assert ArcaliveCrawler("https://arca.live/b/t", session=object(), post_retry=schedule).post_retry is schedule
+
+
 def test_clear_and_retain_forget_state() -> None:
     schedule = make_schedule(FakeClock())
     for post_id in ("1", "2", "3"):
