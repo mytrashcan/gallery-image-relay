@@ -174,7 +174,7 @@ class ArcaBot(discord.Client):
                         self.crawler.mark_failed(post["post_id"])
                         raise
                     if delivered:
-                        self.crawler.mark_sent(post["post_id"])
+                        await run_blocking(self.crawler.mark_sent, post["post_id"])
                     else:
                         self.crawler.mark_failed(post["post_id"])
             except discord.ConnectionClosed:
@@ -217,7 +217,7 @@ class ArcaBot(discord.Client):
                 batch_result = await self._send_image_batch(batch, title, link, batch_start)
                 for item in batch:
                     if batch_result.media_acknowledged(item.content_hash):
-                        self.image_handler.mark_hash_sent(item.content_hash)
+                        await run_blocking(self.image_handler.mark_hash_sent, item.content_hash)
                 delivery_result = delivery_result.merge(batch_result)
             return delivery_result.acknowledged and all_resolved
         finally:
@@ -275,7 +275,12 @@ class ArcaBot(discord.Client):
                 # process_image(압축 등 CPU 작업) 전에 해시를 선점한다. 전송 성공
                 # 시 mark_hash_sent로 확정되고, 실패 시 release_hash로 롤백되므로
                 # 동일 이미지가 여러 게시글에서 동시에 유입돼도 이중 전송되지 않는다.
-                if not self.image_handler.reserve_hash(verified.content_hash):
+                # Check the archive off the loop, then reserve in memory on the loop:
+                # a cancellation can then never lose a reservation made in a thread.
+                if (
+                    await run_blocking(self.image_handler.has_seen_hash, verified.content_hash)
+                    or not self.image_handler.reserve_pending_hash(verified.content_hash)
+                ):
                     logger.info("[아카라이브] 중복 이미지 스킵: [metadata omitted]")
                     return MediaPreparation(None, True)
 

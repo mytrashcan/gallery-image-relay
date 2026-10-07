@@ -10,6 +10,7 @@ from Module.delivery_archive import DeliveryArchive, destination_key
 from Module.delivery_result import ChannelDelivery, DeliveryOutcome, DeliveryResult
 from Module.embeds import make_image_embed
 from Module.gallery_client import GalleryClient
+from Module.lifecycle import run_blocking
 from Module.lru_cache import LRUCache
 
 logger = logging.getLogger(__name__)
@@ -68,21 +69,30 @@ class MediaPipeline:
         self._web_published = LRUCache(2000)
         self._web_queued: set[str] = set()
 
-    def _delivered(self, transport: str, destination: str, media_id: str) -> bool:
+    # Archive calls run in a worker thread: SQLite can wait up to its busy timeout
+    # while another crawler process commits, and that must not stall the event loop.
+
+    async def _delivered(self, transport: str, destination: str, media_id: str) -> bool:
         key = destination_key(transport, destination, media_id)
         if key in self._receipts:
             return True
-        return self.delivery_archive is not None and self.delivery_archive.check(self.source, self.gallery_name, key)
+        return self.delivery_archive is not None and await run_blocking(
+            self.delivery_archive.check, self.source, self.gallery_name, key
+        )
 
-    def _record(self, delivery: ChannelDelivery) -> None:
+    async def _record(self, delivery: ChannelDelivery) -> None:
         logger.info(
             "delivery source=%s gallery=%s transport=%s destination=%s outcome=%s delivered=%s requested=%s",
             self.source, self.gallery_name, delivery.transport, delivery.destination_id,
             delivery.outcome.value, len(delivery.delivered_media), len(delivery.requested_media),
         )
         keys = [destination_key(delivery.transport, delivery.destination_id, m) for m in delivery.delivered_media]
+        # A key in _receipts is already committed (it is added only after the write
+        # below), e.g. by the 413 fallback's per-item callback; skip writing it again.
+        keys = [key for key in keys if key not in self._receipts]
         if keys and self.delivery_archive is not None:
-            self.delivery_archive.add_many(self.source, self.gallery_name, keys)
+            # run_blocking finishes the commit even if this task is cancelled meanwhile.
+            await run_blocking(self.delivery_archive.add_many, self.source, self.gallery_name, keys)
         for key in keys:
             self._receipts.add(key)
 
@@ -269,7 +279,7 @@ class MediaPipeline:
         result = DeliveryResult(())
         for channel_id in self.channel_ids:
             destination_id = str(channel_id)
-            already = tuple(m for m in requested_media if self._delivered("discord", destination_id, m))
+            already = tuple([m for m in requested_media if await self._delivered("discord", destination_id, m)])
             pending = [item for item, m in zip(batch, requested_media, strict=True) if m not in already]
             if not pending:
                 result = result.merge(DeliveryResult((ChannelDelivery(
@@ -307,7 +317,7 @@ class MediaPipeline:
                 requested_media=self._media_ids(pending),
                 on_delivered=self._record,
             )
-            self._record(channel_delivery)
+            await self._record(channel_delivery)
             delivered = tuple(m for m in requested_media if m in already or m in channel_delivery.delivered_media)
             channel_delivery = ChannelDelivery(
                 "discord", destination_id,
@@ -374,7 +384,7 @@ class MediaPipeline:
 
             if self.telegram_enabled:
                 telegram_chat_id = str(getattr(self.message_sender, "telegram_chat_id", "") or "")
-                telegram_sent = self._delivered("telegram", telegram_chat_id, requested_media[0])
+                telegram_sent = await self._delivered("telegram", telegram_chat_id, requested_media[0])
                 if not telegram_sent:
                     telegram_sent = await self.message_sender.send_to_telegram(
                         telegram_buffer,
@@ -391,7 +401,7 @@ class MediaPipeline:
                         ack_eligible=True,
                         reason=None if telegram_sent else "send_failed",
                     )
-                self._record(telegram_delivery)
+                await self._record(telegram_delivery)
                 result = result.merge(DeliveryResult((telegram_delivery,)))
 
             if self.web_gallery_enabled:
