@@ -87,6 +87,9 @@ class MediaPipeline:
             delivery.outcome.value, len(delivery.delivered_media), len(delivery.requested_media),
         )
         keys = [destination_key(delivery.transport, delivery.destination_id, m) for m in delivery.delivered_media]
+        # A key in _receipts is already committed (it is added only after the write
+        # below), e.g. by the 413 fallback's per-item callback; skip writing it again.
+        keys = [key for key in keys if key not in self._receipts]
         if keys and self.delivery_archive is not None:
             # run_blocking finishes the commit even if this task is cancelled meanwhile.
             await run_blocking(self.delivery_archive.add_many, self.source, self.gallery_name, keys)

@@ -172,3 +172,32 @@ def test_hash_lock_is_not_held_during_archive_writes(tmp_path):
         assert archive.check("arcalive", "cats", image_key("h1"))
         assert handler.has_seen_hash("h1") is True
         assert handler.reserve_pending_hash("h1") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("first_send", "expected_writes"), [("ok", 1), ("413", 2)])
+async def test_each_receipt_is_written_once(tmp_path, first_send, expected_writes):
+    import discord
+
+    from Module.message_sender import MessageSender
+
+    calls = 0
+
+    async def send(**kwargs):
+        nonlocal calls
+        calls += 1
+        if first_send == "413" and calls == 1:
+            raise discord.HTTPException(SimpleNamespace(status=413, reason="large"), "large")
+
+    channel = SimpleNamespace(send=send)
+    with DeliveryArchive(tmp_path / "archive.sqlite3") as archive:
+        archive.add_many = MagicMock(wraps=archive.add_many)
+        pipeline = MediaPipeline(MessageSender(None, None), SimpleNamespace(get_channel=lambda _: channel), [1],
+                                 telegram_enabled=False, delivery_archive=archive, source="arcalive", gallery_name="t")
+
+        result = await pipeline.send_discord_batch([media("a"), media("b")], title="", link=None)
+
+        assert result.acknowledged is True
+        assert archive.add_many.call_count == expected_writes  # one batch write, or one per fallback item
+        written = [key for call in archive.add_many.call_args_list for key in call.args[2]]
+        assert sorted(written) == sorted(destination_key("discord", "1", m) for m in ("a", "b"))
