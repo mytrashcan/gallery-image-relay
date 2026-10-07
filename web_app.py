@@ -205,10 +205,7 @@ def _ts_siteverify(token: str, remoteip: str) -> bool:
 # 플래그 파일이 존재하거나 WEB_MAINTENANCE=1 이면 점검 페이지를 보여준다.
 # dcselfie.sh down/up 으로 토글(웹 서버 재시작 없이 즉시 반영).
 def _maintenance_file() -> Path:
-    cfg = app_config.maintenance_file_path
-    if cfg.name != ".maintenance":
-        return cfg
-    return Path(app_config.web_static_dir).parent / ".maintenance"
+    return app_config.maintenance_file_path
 
 
 def _maintenance_on() -> bool:

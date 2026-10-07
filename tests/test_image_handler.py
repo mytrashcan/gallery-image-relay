@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import logging
+import random
 from unittest.mock import MagicMock
 
+import pytest
 import requests
 from PIL import Image
 
@@ -304,6 +307,34 @@ class TestCompress:
 
         assert size <= target
         assert output.read(6) in (b"GIF87a", b"GIF89a")
+
+    @pytest.mark.parametrize(("mode", "fmt"), [("LA", "PNG"), ("I;16", "PNG"), ("CMYK", "TIFF"), ("1", "PNG")])
+    def test_compress_image_converts_jpeg_incompatible_modes(self, mode: str, fmt: str) -> None:
+        noise = Image.frombytes("RGB", (400, 400), random.Random(1).randbytes(400 * 400 * 3))
+        source = io.BytesIO()
+        noise.convert(mode).save(source, format=fmt)
+        data = source.getvalue()
+        target = len(data) // 2
+
+        output, size = ImageHandler().compress_image(data, target, "image")
+
+        assert size <= target
+        assert output.read(2) == b"\xff\xd8"
+
+    def test_compress_logs_omit_filename_and_report_written_size(self, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="Module.image_handler")
+        handler = ImageHandler()
+        png = make_png_bytes(size=(800, 800))
+        gif = make_gif_bytes(frames=12, size=(400, 400))
+
+        handler.compress_image(png, len(png) // 2, "private-label.png")
+        handler.compress_gif(gif, int(len(gif) * 0.8), "private-label.gif")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(message.startswith("[이미지 압축]") for message in messages)
+        assert any(message.startswith("[GIF 압축]") for message in messages)
+        assert not any("private-label" in message for message in messages)
+        assert not any("-> 0 bytes" in message for message in messages)
 
     def test_compress_image_invalid_data_returns_original(self) -> None:
         handler = ImageHandler()

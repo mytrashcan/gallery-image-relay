@@ -172,6 +172,31 @@ def test_large_image_has_in_memory_thumbnail(monkeypatch, tmp_path):
     assert thumb.headers["cache-control"] == "no-store"
 
 
+def test_configured_maintenance_flag_path_is_used(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "web_maintenance", False)
+    flag = tmp_path / "flags" / ".maintenance"
+    flag.parent.mkdir()
+    monkeypatch.setattr(web_app.app_config, "web_maintenance_file", str(flag))
+
+    assert client.get("/").status_code == 200
+    flag.touch()
+    assert client.get("/").status_code == 503
+    flag.unlink()
+    (tmp_path / ".maintenance").touch()  # default location beside web_static
+    assert client.get("/").status_code == 200
+
+
+def test_default_maintenance_flag_sits_beside_static_dir(monkeypatch, tmp_path):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "web_maintenance", False)
+    monkeypatch.setattr(web_app.app_config, "web_maintenance_file", "")
+
+    assert client.get("/").status_code == 200
+    (tmp_path / ".maintenance").touch()
+    assert client.get("/").status_code == 503
+
+
 def test_duplicate_content_is_suppressed(monkeypatch, tmp_path):
     client, _ = make_client(monkeypatch, tmp_path)
     data = image_bytes()
