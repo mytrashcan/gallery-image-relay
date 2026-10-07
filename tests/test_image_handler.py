@@ -171,6 +171,53 @@ class TestProcessImage:
         assert len(telegram_buffer.getvalue()) == 190
 
 
+class TestTruncatedImages:
+    @staticmethod
+    def encode(fmt: str, mode: str = "RGB", **kwargs: object) -> bytes:
+        noise = Image.frombytes("RGB", (320, 240), bytes(range(256)) * 900)
+        output = io.BytesIO()
+        noise.convert(mode).save(output, format=fmt, **kwargs)
+        return output.getvalue()
+
+    @pytest.mark.parametrize(("fmt", "kwargs"), [
+        ("JPEG", {}), ("JPEG", {"progressive": True}), ("GIF", {}), ("BMP", {}), ("PNG", {}), ("WEBP", {}),
+    ])
+    def test_truncated_static_image_is_rejected(self, fmt: str, kwargs: dict) -> None:
+        data = self.encode(fmt, **kwargs)
+
+        ImageHandler.validate_image_data(data)
+        with pytest.raises(ValueError):
+            ImageHandler.validate_image_data(data[: len(data) // 2])
+
+    @pytest.mark.parametrize("mode", ["L", "CMYK"])
+    def test_complete_jpeg_in_other_modes_is_accepted(self, mode: str) -> None:
+        ImageHandler.validate_image_data(self.encode("JPEG", mode))
+
+    def test_truncated_animation_is_rejected(self) -> None:
+        data = make_gif_bytes(frames=6, size=(120, 120))
+
+        ImageHandler.validate_image_data(data)
+        with pytest.raises(ValueError):
+            ImageHandler.validate_image_data(data[: len(data) // 2])
+
+    def test_truncated_download_is_a_permanent_rejection(self) -> None:
+        from Module.media_candidate import MediaCandidate
+        from Module.media_download import MediaDownloadRejected, download_media_candidate
+
+        data = self.encode("JPEG")[:-200]
+        response = MagicMock(status_code=200, headers={})
+        response.iter_content.return_value = [data]
+        client = MagicMock()
+        client.get.return_value = response
+
+        with pytest.raises(MediaDownloadRejected):
+            download_media_candidate(
+                client, MediaCandidate("https://dcimg8.dcinside.co.kr/cut.jpg"),
+                is_allowed_url=ImageHandler._is_allowed_dc_image_url,
+                validate=ImageHandler.validate_image_data, timeout=1, max_bytes=10**6,
+            )
+
+
 class TestDownloadImages:
     def make_handler(self, html: str, image_data: bytes) -> ImageHandler:
         handler = ImageHandler()

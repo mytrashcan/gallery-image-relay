@@ -5,7 +5,7 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py311"  # lowest supported Python (CI tests 3.11 and 3.12)
 
 [tool.ruff.lint]
 select = [

@@ -654,3 +654,39 @@ async def test_idle_ttl_sweeper_and_shutdown_clear_ram(monkeypatch, tmp_path):
         assert store._items
     assert not store._items
     assert not store._recent_hashes
+
+
+def test_proxy_header_without_origin_secret_warns_once(monkeypatch, tmp_path, caplog):
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "web_origin_secret", "")
+    monkeypatch.setattr(web_app, "_proxy_secret_warning_logged", False)
+    caplog.set_level("WARNING", logger="web_app")
+
+    client.get("/feed")
+    assert not caplog.records
+    for address in ("198.51.100.1", "198.51.100.2"):
+        client.get("/feed", headers={"cf-connecting-ip": address})
+
+    warnings = [r for r in caplog.records if "WEB_ORIGIN_SECRET is not set" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize(("secret", "supplied", "trusted"), [
+    ("", "", "testclient"),
+    ("origin-secret", "wrong", "testclient"),
+    ("origin-secret", "origin-secret", "198.51.100.7"),
+])
+def test_honeypot_records_trusted_ip_and_claimed_header_separately(
+    monkeypatch, tmp_path, secret, supplied, trusted,
+):
+    recorded = []
+    monkeypatch.setattr(web_app.HoneypotRecorder, "record", lambda self, **event: recorded.append(event) or event)
+    client, _ = make_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(web_app.app_config, "web_origin_secret", secret)
+
+    client.get("/wp-login.php", headers={
+        "User-Agent": "curl/8.0", "cf-connecting-ip": "198.51.100.7", "x-origin-secret": supplied,
+    })
+
+    assert recorded[0]["source_ip"] == trusted
+    assert recorded[0]["claimed_ip"] == "198.51.100.7"

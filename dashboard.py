@@ -73,15 +73,18 @@ def _fetch(path: object, timeout: object=2.0 if not REMOTE else 5.0) -> object:
 def _scan_procs() -> object:
     """run_gallery.py / launcher.py / run_web_server.py 프로세스 수집."""
     crawlers, services = {}, {}
+    galleries = _configs()  # 한 번만 읽는다 (프로세스마다 다시 읽지 않음)
     for p in psutil.process_iter(["pid", "cmdline", "create_time"]):
         try:
-            cmd = " ".join(p.info["cmdline"] or [])
+            argv = p.info["cmdline"] or []
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+        cmd = " ".join(argv)
         if "run_gallery.py" in cmd:
-            for g in _configs():
-                if f" {g}" in cmd or cmd.endswith(g):
-                    crawlers[g] = p
+            # run_gallery.py <gallery_name>: 마지막 인자와 정확히 일치해야 한다
+            # (부분 문자열 비교는 arca 와 arca_genshin 같은 이름을 혼동한다).
+            if argv[-1] in galleries:
+                crawlers[argv[-1]] = p
         elif "launcher.py" in cmd:
             services["launcher"] = p
         elif "run_web_server.py" in cmd or "run_web_gallery.py" in cmd:

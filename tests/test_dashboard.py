@@ -7,6 +7,23 @@ from rich.console import Console
 import dashboard
 
 
+def test_scan_procs_matches_gallery_argument_exactly(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    def proc(*argv: str) -> SimpleNamespace:
+        return SimpleNamespace(info={"pid": 1, "cmdline": list(argv), "create_time": 0.0})
+
+    genshin = proc("python3", "/srv/app/run_gallery.py", "arca_genshin")
+    zzz = proc("python3", "/srv/app/run_gallery.py", "zzz")
+    other = proc("python3", "/srv/app/run_gallery.py", "unknown")
+    monkeypatch.setattr(dashboard.psutil, "process_iter", lambda attrs: [genshin, zzz, other])
+    monkeypatch.setattr(dashboard, "_configs", lambda: {"arca": {}, "arca_genshin": {}, "zzz": {}})
+
+    crawlers, _ = dashboard._scan_procs()
+
+    assert crawlers == {"arca_genshin": genshin, "zzz": zzz}
+
+
 def test_services_panel_handles_stale_empty_feed() -> None:
     panel = dashboard._services_panel(
         {

@@ -23,6 +23,7 @@ from Module.lifecycle import run_blocking
 from Module.lru_cache import LRUCache
 from Module.memory_gallery import ImageTooLarge, InvalidImage, MemoryGalleryStore
 
+logger = logging.getLogger(__name__)
 
 def _static_dir() -> Path:
     return Path(app_config.web_static_dir)
@@ -76,17 +77,34 @@ _FEED_RATE_WINDOW = 60.0
 _FEED_RATE_MAX = 120
 
 
+_proxy_secret_warning_logged = False
+
+
+def _warn_proxy_header_without_secret() -> None:
+    global _proxy_secret_warning_logged
+    if _proxy_secret_warning_logged:
+        return
+    _proxy_secret_warning_logged = True
+    logger.warning(
+        "cf-connecting-ip received but WEB_ORIGIN_SECRET is not set: the header is ignored, so all "
+        "clients behind the proxy share one rate-limit and like bucket (see docs/deployment.md)"
+    )
+
+
 def _client_ip(request: Request) -> str:
     """Cloudflare 경유 시 실제 클라이언트 IP, 아니면 소켓 상의 IP.
 
-    cf-connecting-ip 헤더는 클라이언트가 위조할 수 있으므로, WEB_ORIGIN_SECRET이
-    설정돼 있으면 같은 값의 x-origin-secret 헤더가 동반될 때만 신뢰한다(미설정 시
-    기존 동작 유지). 오리진 포트가 외부에 직접 노출돼도 헤더 위조로 rate limit·
-    Turnstile 우회를 할 수 없게 하는 최소 방어선.
+    cf-connecting-ip 헤더는 클라이언트가 위조할 수 있으므로 WEB_ORIGIN_SECRET과 같은
+    x-origin-secret 헤더가 함께 올 때만 신뢰한다. WEB_ORIGIN_SECRET이 없으면 이 헤더를
+    항상 무시하고 소켓 주소를 쓴다(터널 뒤에서는 모든 방문자가 같은 주소가 되므로,
+    처음 한 번 경고를 남긴다). 오리진 포트가 외부에 직접 노출돼도 헤더 위조로
+    rate limit·Turnstile을 우회할 수 없게 하는 최소 방어선.
     """
     ip = request.headers.get("cf-connecting-ip")
     if ip is not None:
         secret = app_config.web_origin_secret
+        if not secret:
+            _warn_proxy_header_without_secret()
         supplied = request.headers.get("x-origin-secret", "")
         if secret and hmac.compare_digest(
             secret.encode(), supplied.encode("latin-1", "backslashreplace")
@@ -504,5 +522,5 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
             "maintenance": _maintenance_on(),
         })
 
-    install_trap(app, HoneypotRecorder())
+    install_trap(app, HoneypotRecorder(), client_ip=_client_ip)
     return app
