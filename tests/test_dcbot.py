@@ -240,6 +240,39 @@ async def test_failed_delivery_is_not_acknowledged(mock_dependencies, bot):
             await asyncio.wait_for(bot.start_crawling(), timeout=0.05)
 
     crawler_mock.mark_sent.assert_not_called()
+    crawler_mock.mark_failed.assert_called_with("4")
+
+
+@pytest.mark.asyncio
+async def test_delivery_exception_defers_post(mock_dependencies, bot):
+    crawler_mock, _ = mock_dependencies
+    post = {"title": "boom", "link": "https://example.com/5", "post_id": "5", "has_image": True}
+    crawler_mock.get_latest_post.return_value = post
+    bot.process_post = AsyncMock(side_effect=RuntimeError("transport bug"))
+
+    with patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bot.start_crawling(), timeout=0.05)
+
+    crawler_mock.mark_sent.assert_not_called()
+    crawler_mock.mark_failed.assert_called_with("5")
+
+
+@pytest.mark.asyncio
+async def test_post_without_image_is_acknowledged_without_deferral(mock_dependencies, bot):
+    crawler_mock, _ = mock_dependencies
+    crawler_mock.get_latest_post.return_value = {
+        "title": "text", "link": "https://example.com/6", "post_id": "6", "has_image": False,
+    }
+    bot.process_post = AsyncMock()
+
+    with patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bot.start_crawling(), timeout=0.05)
+
+    bot.process_post.assert_not_awaited()
+    crawler_mock.mark_sent.assert_called_with("6")
+    crawler_mock.mark_failed.assert_not_called()
 
 
 @pytest.mark.asyncio

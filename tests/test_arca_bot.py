@@ -355,6 +355,26 @@ async def test_failed_post_delivery_is_not_acknowledged(mock_dependencies, bot):
             await asyncio.wait_for(bot.start_crawling(), timeout=0.05)
 
     crawler_mock.mark_sent.assert_not_called()
+    crawler_mock.mark_failed.assert_called_with("12")
+
+
+@pytest.mark.asyncio
+async def test_failed_post_is_deferred_and_later_posts_still_processed(mock_dependencies, bot):
+    crawler_mock, _, _ = mock_dependencies
+    posts = [
+        {"title": "stuck", "link": "https://arca.live/b/test/20", "post_id": "20"},
+        {"title": "next", "link": "https://arca.live/b/test/21", "post_id": "21"},
+    ]
+    crawler_mock.get_latest_posts.return_value = posts
+    bot.process_post = AsyncMock(side_effect=lambda post: post["post_id"] == "21")
+
+    with patch("asyncio.sleep", AsyncMock()):
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bot.start_crawling(), timeout=0.05)
+
+    crawler_mock.mark_failed.assert_any_call("20")
+    crawler_mock.mark_sent.assert_any_call("21")
+    assert "20" not in [c.args[0] for c in crawler_mock.mark_sent.call_args_list]
 
 
 @pytest.mark.asyncio

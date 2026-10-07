@@ -33,6 +33,8 @@ TELEGRAM_MAX_SIZE = 10 * 1024 * 1024
 
 MAX_HASH_CACHE_SIZE = 1000
 MAX_GIF_FRAMES = 20
+# Image elements tried per post when earlier ones are permanently rejected.
+MAX_DC_IMAGE_ELEMENTS = 5
 
 
 class ImageHandler:
@@ -377,9 +379,12 @@ class ImageHandler:
     def download_images(self, url: object) -> list | None:
         """Download the first eligible image from a post.
 
-        Returns ``None`` when no image can be downloaded or processing fails,
-        ``[]`` when the image hash has already been seen, and a one-item list
-        containing the processed image buffers and metadata on success.
+        A permanently rejected image (disallowed host, invalid or oversized data)
+        is skipped in favour of the next one, up to ``MAX_DC_IMAGE_ELEMENTS``.
+        Returns ``None`` when a transient failure should be retried later, ``[]``
+        when every tried image was rejected or the selected image's hash has
+        already been seen, and a one-item list containing the processed image
+        buffers and metadata on success.
         """
         try:
             post_url = str(url)
@@ -400,18 +405,22 @@ class ImageHandler:
             ]
             if not image_elements:
                 image_elements = soup.select(".writing_view_box img, .write_div img")
-            for element in image_elements:
+            for element in image_elements[:MAX_DC_IMAGE_ELEMENTS]:
                 candidate = self._media_candidate(element, post_url, headers)
                 if candidate is None:
                     continue
-                verified = download_media_candidate(
-                    self.session,
-                    candidate,
-                    is_allowed_url=self._is_allowed_dc_image_url,
-                    validate=self.validate_image_data,
-                    timeout=REQUEST_TIMEOUT,
-                    max_bytes=app_config.media_download_max_mb * 1024 * 1024,
-                )
+                try:
+                    verified = download_media_candidate(
+                        self.session,
+                        candidate,
+                        is_allowed_url=self._is_allowed_dc_image_url,
+                        validate=self.validate_image_data,
+                        timeout=REQUEST_TIMEOUT,
+                        max_bytes=app_config.media_download_max_mb * 1024 * 1024,
+                    )
+                except MediaDownloadRejected as exc:
+                    logger.warning("이미지가 영구적으로 거절되어 다음 이미지를 시도합니다: %s", type(exc).__name__)
+                    continue
 
                 if self.has_seen_hash(verified.content_hash):
                     logger.info("동일한 파일이 존재합니다. PASS: [metadata omitted]")
@@ -447,6 +456,3 @@ class ImageHandler:
         except requests.RequestException as e:
             logger.error(f"이미지 다운로드 실패: {type(e).__name__}")
             return None
-        except MediaDownloadRejected as exc:
-            logger.warning("이미지가 영구적으로 거절되어 건너뜁니다: %s", type(exc).__name__)
-            return []

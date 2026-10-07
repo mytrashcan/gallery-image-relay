@@ -18,6 +18,7 @@ from Module.arca_crawler import (
     _mask_proxy,
 )
 from Module.delivery_archive import DeliveryArchive, post_key
+from Module.post_retry import PostRetrySchedule
 from Module.retry_policy import RetryPolicy
 
 
@@ -311,6 +312,26 @@ def test_archive_dedups_posts_after_restart(monkeypatch: object, tmp_path) -> No
         assert [post["post_id"] for post in restarted.get_latest_posts()] == ["1"]
         assert "0" in restarted.sent_items
         assert archive.check("arcalive", "genshin", post_key("0")) is True
+
+
+def test_deferred_posts_do_not_occupy_cycle_slots(monkeypatch: object) -> None:
+    monkeypatch.setattr("Module.arca_crawler.POST_SKIP_COUNT", 0)
+    rows = "".join(
+        f'<a class="vrow column" href="/b/genshin/{i}">'
+        f'<span class="title">글{i}</span><span class="media-icon"></span></a>'
+        for i in range(4)
+    )
+    base_url = "https://arca.live/b/genshin"
+    clock = [0.0]
+    c = make_crawler(FakeSession({base_url: rows}))
+    c.post_retry = PostRetrySchedule(base_delay=60, max_delay=600, clock=lambda: clock[0])
+
+    for post in c.get_latest_posts(max_posts=2):
+        c.mark_failed(post["post_id"])
+
+    assert [p["post_id"] for p in c.get_latest_posts(max_posts=2)] == ["2", "3"]
+    clock[0] = 60
+    assert [p["post_id"] for p in c.get_latest_posts(max_posts=2)] == ["0", "1"]
 
 
 def test_get_latest_posts_allows_same_title_for_different_post_ids(monkeypatch: object) -> None:

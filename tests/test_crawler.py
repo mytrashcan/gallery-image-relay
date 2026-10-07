@@ -6,6 +6,7 @@ import pytest
 
 from Module.crawler import BoundedSet, DCInsideCrawler
 from Module.delivery_archive import DeliveryArchive, post_key
+from Module.post_retry import PostRetrySchedule
 from Module.retry_policy import RetryPolicy
 
 
@@ -182,6 +183,45 @@ class TestGetLatestPost:
 
         assert crawler.get_latest_post()["post_id"] == "20"
         assert crawler.session.get.call_count == 2
+
+    def test_failed_oldest_post_does_not_block_newer_posts(self) -> None:
+        clock = [0.0]
+        rows = make_safety_rows() + [
+            make_post_row("stuck", 20, has_image=True),
+            make_post_row("next", 21, has_image=True),
+        ]
+        crawler = make_crawler(make_list_html(rows))
+        crawler.post_retry = PostRetrySchedule(base_delay=60, max_delay=600, clock=lambda: clock[0])
+
+        assert crawler.get_latest_post()["post_id"] == "20"
+        crawler.mark_failed("20")
+        assert crawler.get_latest_post()["post_id"] == "21"
+        crawler.mark_sent("21")
+        assert crawler.get_latest_post() is None
+
+        clock[0] = 60
+        assert crawler.get_latest_post()["post_id"] == "20"
+
+    def test_failed_post_is_never_acknowledged(self, tmp_path) -> None:
+        with DeliveryArchive(tmp_path / "delivery.sqlite3") as archive:
+            crawler = DCInsideCrawler(
+                "https://gall.dcinside.com/mgallery/board/lists/?id=test",
+                gallery_name="cats",
+                delivery_archive=archive,
+            )
+            for _ in range(3):
+                crawler.mark_failed("20")
+
+            assert "20" not in crawler.sent_post_ids
+            assert archive.check("dcinside", "cats", post_key("20")) is False
+
+    def test_retry_state_is_bounded_to_visible_posts(self) -> None:
+        crawler = make_crawler(make_list_html(make_safety_rows() + [make_post_row("next", 21, True)]))
+        crawler.mark_failed("5")
+
+        crawler.get_latest_post()
+
+        assert len(crawler.post_retry) == 0
 
 
 @pytest.mark.parametrize("has_image", [True, False])

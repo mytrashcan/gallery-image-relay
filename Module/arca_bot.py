@@ -168,8 +168,15 @@ class ArcaBot(discord.Client):
                 posts = await run_blocking(self.crawler.get_latest_posts)
                 for post in posts:
                     logger.info("post selected source=arcalive gallery=%s post_id=%s", self.web_gallery_name, post["post_id"])
-                    if await self.process_post(post):
+                    try:
+                        delivered = await self.process_post(post)
+                    except Exception:
+                        self.crawler.mark_failed(post["post_id"])
+                        raise
+                    if delivered:
                         self.crawler.mark_sent(post["post_id"])
+                    else:
+                        self.crawler.mark_failed(post["post_id"])
             except discord.ConnectionClosed:
                 logger.warning("[아카라이브] Discord 연결 끊김. 재연결 대기...")
                 await asyncio.sleep(5)
