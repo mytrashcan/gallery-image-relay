@@ -310,7 +310,7 @@ Notes for small instances (1 GB RAM free tier):
 | `WEB_GALLERY_URL` | env | `http://127.0.0.1:8000` | Internal web-gallery origin |
 | `WEB_STATIC_DIR` | env | `web_static` | Directory for HTML/CSS/static assets only |
 | `WEB_THUMB_WIDTH` | env | 480 | In-memory card-thumbnail width (`0` disables) |
-| `WEB_MAINTENANCE` | env | unset | Set to `1` to force the maintenance page (`503`). A `.maintenance` flag file next to the project (toggled by `./dcselfie.sh down` / `up`, no restart needed) has the same effect |
+| `WEB_MAINTENANCE` | env | unset | Set to `1` to force the maintenance page (`503`). A `.maintenance` flag file next to the project, or the path set in `WEB_MAINTENANCE_FILE`, has the same effect; `./dcselfie.sh down` / `up` toggle that same path (no restart needed) |
 | `ARCA_SOCKS_PROXY` | `.env` (never commit) | unset | `socks5://...` proxy the Arcalive crawler routes through - see "Arcalive Cloudflare bypass" below |
 | `ARCA_DOWNLOAD_CONCURRENCY` | env | 2 | Bounded concurrent Arcalive CDN downloads per crawler |
 | `MEDIA_DOWNLOAD_MAX_MB` | env | 15 | Hard streaming limit for each source image download |
@@ -347,7 +347,7 @@ Turnstile, when configured, protects `/feed`, `/images/*` and `/like/*` regardle
 
 Application image buffers never use temporary files. Root application logging redacts HTTP/SOCKS URLs, configured tokens and transport exception details; post titles and filenames have been removed from crawler logs. Public request access logs and optional honeypot diagnostics are separate metadata. Honeypot events default to a bounded RAM ring (1,000 events, 100/minute); `HONEYPOT_LOG_PATH` explicitly enables a rotating file (4 MiB plus one backup) containing bounded IP/UA/path metadata. Set OS journal/log rotation and avoid HTTP debug logging. This application cannot erase copies retained by external platforms, browsers, crash collectors, swap, hibernation or infrastructure logs.
 
-Default web capacity counts original and thumbnail byte lengths (256 MiB), not total process RSS. Two active ingest requests and four verification requests are admitted; overload returns 503 and body reads time out after 10 seconds. The TTL sweeper runs every second and clears RAM on shutdown. Source HTML is capped at 4 MiB, media at 15 MiB, and redirects are revalidated before each fetch. Provision memory for decoded images, queues and the Python runtime as well as the store. Arcalive concurrency is validated in the range 1–4.
+Default web capacity counts original and thumbnail byte lengths (256 MiB), not total process RSS. Two active ingest requests and four verification requests are admitted; overload returns 503 and body reads time out after 10 seconds. The TTL sweeper runs every second and clears RAM on shutdown. Source HTML is capped at 4 MiB, media at 15 MiB, and redirects are revalidated before each fetch. Each download chain (attempts, redirects, retry waits and body reads) has a wall-clock deadline of max(30 s, 4 × the request timeout), which is 60 s for the crawlers' 15 s page and image timeouts; a body that trickles in slower than that is cut off rather than held open by per-read timeouts. Provision memory for decoded images, queues and the Python runtime as well as the store. Arcalive concurrency is validated in the range 1–4.
 
 See [production review and change rationale](docs/production-hardening.md) and [deployment/recovery](docs/deployment.md).
 

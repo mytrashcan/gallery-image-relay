@@ -623,16 +623,25 @@
     function likeCard(card) {
       popHeart(card);
       const id = card.dataset.id;
-      if (!id || localStorage.getItem('liked_' + id)) return; // 이미 누른 이미지는 애니메이션만
-      localStorage.setItem('liked_' + id, '1');
+      // 이미 누른 이미지와 전송 중인 이미지는 애니메이션만
+      if (!id || localStorage.getItem('liked_' + id) || card.dataset.likePending) return;
+      card.dataset.likePending = '1';
       const hi = card.querySelector('.hi');
-      if (hi) hi.textContent = '♥';
       const lc = card.querySelector('.lc');
+      const before = { heart: hi && hi.textContent, likes: lc && lc.textContent };
+      localStorage.setItem('liked_' + id, '1');
+      if (hi) hi.textContent = '♥';
       if (lc) lc.textContent = (Number(lc.textContent) || 0) + 1; // 낙관적 갱신
       fetch('/like/' + encodeURIComponent(id), { method: 'POST' })
-        .then(r => r.ok ? r.json() : null)
+        .then(r => { if (!r.ok) throw new Error('like failed: ' + r.status); return r.json(); })
         .then(d => { if (d && lc) lc.textContent = d.likes; })
-        .catch(() => {});
+        .catch(() => {
+          // 429·403·404·네트워크 오류: 낙관적 갱신을 되돌려 다시 누를 수 있게 한다
+          localStorage.removeItem('liked_' + id);
+          if (hi) hi.textContent = before.heart;
+          if (lc) lc.textContent = before.likes;
+        })
+        .finally(() => { delete card.dataset.likePending; });
     }
 
     // ── 호버 시 원본으로 교체 (크로스페이드) ──

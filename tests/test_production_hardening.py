@@ -173,6 +173,17 @@ def test_configuration_fails_fast(kwargs):
         AppConfig(**kwargs)
 
 
+def test_invalid_integer_setting_names_the_variable_without_echoing_it(monkeypatch):
+    from Module.config import AppConfig
+
+    monkeypatch.setenv("WEB_PORT", "80 80-secretish")
+
+    with pytest.raises(ValueError) as caught:
+        AppConfig.from_env()
+
+    assert str(caught.value) == "WEB_PORT must be an integer"
+
+
 def test_gallery_configuration_validation_and_cwd_independence(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert load_gallery_configs()

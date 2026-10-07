@@ -4,6 +4,8 @@ discord.py~=2.4
 psutil~=6.1
 python-dotenv~=1.0
 requests~=2.32
+# HTTPResponse.shutdown() (2.3+) lets the download deadline interrupt a blocked read.
+urllib3>=2.3,<3
 python-telegram-bot~=21.10
 Pillow~=12.2
 lxml~=6.1

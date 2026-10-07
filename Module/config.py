@@ -45,6 +45,17 @@ def load_gallery_configs(path: str | Path | None = None) -> dict:
     return values
 
 
+def env_int(name: str, default: int) -> int:
+    """Read an integer setting, naming the variable when its value is invalid."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
+
+
 @dataclass
 class AppConfig:
     """Centralized application configuration loaded from environment variables.
@@ -139,7 +150,7 @@ class AppConfig:
     def from_env(cls) -> "AppConfig":
         """Build an AppConfig instance by reading all environment variables."""
         # DISCORD_MAX_SIZE_MB with safe fallback
-        discord_max_size_mb_val = int(os.getenv("DISCORD_MAX_SIZE_MB", "10"))
+        discord_max_size_mb_val = env_int("DISCORD_MAX_SIZE_MB", 10)
 
         return cls(
             discord_token=os.getenv("DISCORD_TOKEN", ""),
@@ -148,16 +159,16 @@ class AppConfig:
             telegram_chat_id=os.getenv("TELEGRAM_CHANNEL", ""),
             web_static_dir=os.getenv("WEB_STATIC_DIR", str(PROJECT_ROOT / "web_static")),
             web_host=os.getenv("WEB_HOST", "127.0.0.1"),
-            web_port=int(os.getenv("WEB_PORT", "8000")),
-            web_image_ttl_seconds=int(os.getenv("WEB_IMAGE_TTL_SECONDS", str(3 * 60 * 60))),
-            web_feed_max_items=int(os.getenv("WEB_FEED_MAX_ITEMS", "120")),
-            web_thumb_width=int(os.getenv("WEB_THUMB_WIDTH", "480")),
-            web_memory_max_mb=int(os.getenv("WEB_MEMORY_MAX_MB", "256")),
-            web_image_max_mb=int(os.getenv("WEB_IMAGE_MAX_MB", "12")),
-            web_ingest_max_mb=int(os.getenv("WEB_INGEST_MAX_MB", "12")),
-            web_upload_queue_size=int(os.getenv("WEB_UPLOAD_QUEUE_SIZE", "20")),
-            web_upload_queue_max_mb=int(os.getenv("WEB_UPLOAD_QUEUE_MAX_MB", "32")),
-            web_freshness_seconds=int(os.getenv("WEB_FRESHNESS_SECONDS", "900")),
+            web_port=env_int("WEB_PORT", 8000),
+            web_image_ttl_seconds=env_int("WEB_IMAGE_TTL_SECONDS", 3 * 60 * 60),
+            web_feed_max_items=env_int("WEB_FEED_MAX_ITEMS", 120),
+            web_thumb_width=env_int("WEB_THUMB_WIDTH", 480),
+            web_memory_max_mb=env_int("WEB_MEMORY_MAX_MB", 256),
+            web_image_max_mb=env_int("WEB_IMAGE_MAX_MB", 12),
+            web_ingest_max_mb=env_int("WEB_INGEST_MAX_MB", 12),
+            web_upload_queue_size=env_int("WEB_UPLOAD_QUEUE_SIZE", 20),
+            web_upload_queue_max_mb=env_int("WEB_UPLOAD_QUEUE_MAX_MB", 32),
+            web_freshness_seconds=env_int("WEB_FRESHNESS_SECONDS", 900),
             web_gallery_url=os.getenv("WEB_GALLERY_URL", "http://127.0.0.1:8000"),
             web_ingest_token=os.getenv("WEB_INGEST_TOKEN", ""),
             web_maintenance=os.getenv("WEB_MAINTENANCE") == "1",
@@ -167,11 +178,11 @@ class AppConfig:
             turnstile_secret=os.getenv("TURNSTILE_SECRET", ""),
             web_origin_secret=os.getenv("WEB_ORIGIN_SECRET", ""),
             arca_socks_proxy=os.getenv("ARCA_SOCKS_PROXY", ""),
-            arca_download_concurrency=int(os.getenv("ARCA_DOWNLOAD_CONCURRENCY", "2")),
-            media_download_max_mb=int(os.getenv("MEDIA_DOWNLOAD_MAX_MB", "15")),
-            media_max_pixels=int(os.getenv("MEDIA_MAX_PIXELS", "24000000")),
-            media_max_frames=int(os.getenv("MEDIA_MAX_FRAMES", "200")),
-            media_max_animation_pixels=int(os.getenv("MEDIA_MAX_ANIMATION_PIXELS", "60000000")),
+            arca_download_concurrency=env_int("ARCA_DOWNLOAD_CONCURRENCY", 2),
+            media_download_max_mb=env_int("MEDIA_DOWNLOAD_MAX_MB", 15),
+            media_max_pixels=env_int("MEDIA_MAX_PIXELS", 24000000),
+            media_max_frames=env_int("MEDIA_MAX_FRAMES", 200),
+            media_max_animation_pixels=env_int("MEDIA_MAX_ANIMATION_PIXELS", 60000000),
             archive_path=os.getenv("ARCHIVE_PATH") or DEFAULT_ARCHIVE_PATH,
             dash_host=os.getenv("DASH_HOST", "127.0.0.1"),
             dash_base_url=os.getenv("DASH_BASE_URL", "").strip().rstrip("/"),
@@ -230,6 +241,9 @@ except ImportError:
     BS_PARSER = "html.parser"
 
 # 헤더 설정
+# Accept-Encoding is deliberately omitted: requests advertises only encodings urllib3
+# can decode here (br only when a Brotli decoder is installed). A hard-coded "br"
+# without a decoder would hand compressed bytes to the HTML parser.
 HEADERS = {
     "Connection": "keep-alive",
     "Cache-Control": "max-age=0",
@@ -242,7 +256,6 @@ HEADERS = {
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-User": "?1",
     "Sec-Fetch-Dest": "document",
-    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 

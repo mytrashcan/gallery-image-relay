@@ -27,6 +27,9 @@ from Module.url_policy import https_host
 
 logger = logging.getLogger(__name__)
 
+# verify() does not read pixel data for these formats, so a truncated file passes it.
+_DECODE_CHECK_FORMATS = frozenset({"JPEG", "GIF", "BMP"})
+
 # Telegram: 10MB (photo), 50MB (document)
 # Discord 제한은 서버 부스트 레벨에 따라 다르므로 config.DISCORD_MAX_SIZE(.env로 조정 가능) 사용
 TELEGRAM_MAX_SIZE = 10 * 1024 * 1024
@@ -172,7 +175,7 @@ class ImageHandler:
                 if output.tell() <= target_size:
                     size = output.tell()
                     output.seek(0)
-                    logger.info(f"[GIF 압축] [metadata omitted]: {original_size} -> {output.tell()} bytes (scale: {scale:.1f})")
+                    logger.info(f"[GIF 압축] [metadata omitted]: {original_size} -> {size} bytes (scale: {scale:.1f})")
                     return output, size
 
                 scale -= 0.1
@@ -194,7 +197,9 @@ class ImageHandler:
             buffer = io.BytesIO(image_data)
             img = Image.open(buffer)
 
-            if img.mode in ('RGBA', 'P'):
+            # JPEG cannot store alpha or high-bit-depth modes (LA, PA, I;16, ...);
+            # saving them fails and would return the oversized original instead.
+            if img.mode not in ('RGB', 'L'):
                 img = img.convert('RGB')
 
             # Cap web-delivery JPEGs at 95: quality 100 greatly increases size
@@ -216,7 +221,7 @@ class ImageHandler:
             if best_output is not None:
                 best_output.seek(0)
                 logger.info(
-                    f"[이미지 압축] {filename}: {original_size} -> {best_output.getbuffer().nbytes} "
+                    f"[이미지 압축] [metadata omitted]: {original_size} -> {best_output.getbuffer().nbytes} "
                     f"bytes (quality: {best_quality})"
                 )
                 return best_output, best_output.getbuffer().nbytes
@@ -234,7 +239,7 @@ class ImageHandler:
                 if output.tell() <= target_size:
                     size = output.tell()
                     output.seek(0)
-                    logger.info(f"[이미지 압축] [metadata omitted]: {original_size} -> {output.tell()} bytes (scale: {scale:.1f})")
+                    logger.info(f"[이미지 압축] [metadata omitted]: {original_size} -> {size} bytes (scale: {scale:.1f})")
                     return output, size
 
                 scale -= 0.15
@@ -319,7 +324,14 @@ class ImageHandler:
                             or total_pixels > app_config.media_max_animation_pixels):
                             raise ValueError("animation exceeds frame/pixel budget")
                     return
+                image_format = image.format
                 image.verify()
+            if image_format in _DECODE_CHECK_FORMATS:
+                with Image.open(io.BytesIO(image_data)) as decoded:
+                    # JPEG decodes at 1/8 scale here, which still reads every scan;
+                    # draft() is a no-op for GIF and BMP.
+                    decoded.draft(decoded.mode, (max(1, width // 8), max(1, height // 8)))
+                    decoded.load()
         except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
             raise ValueError("invalid image data") from exc
 

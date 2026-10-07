@@ -224,6 +224,19 @@ class TestGetLatestPost:
         assert len(crawler.post_retry) == 0
 
 
+def test_advertised_content_encodings_are_decodable() -> None:
+    """Advertising an encoding without its decoder hands compressed bytes to the parser."""
+    import urllib3.response
+
+    from Module.image_handler import ImageHandler
+
+    decoders = set(urllib3.response.HTTPResponse.CONTENT_DECODERS)
+    for session in (DCInsideCrawler("https://gall.dcinside.com/mgallery/board/lists/?id=test").session,
+                    ImageHandler().session):
+        advertised = {value.strip() for value in session.headers["Accept-Encoding"].split(",")}
+        assert advertised <= decoders
+
+
 @pytest.mark.parametrize("has_image", [True, False])
 def test_image_check(has_image: object) -> None:
     from bs4 import BeautifulSoup

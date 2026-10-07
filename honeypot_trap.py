@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -217,11 +217,14 @@ class HoneypotRecorder:
         matched_signature: str,
         status_code: int,
         response_shape: str,
+        claimed_ip: str = "",
     ) -> dict[str, Any]:
         event = {
             "timestamp": datetime.now(UTC).isoformat(),
             "event_id": uuid.uuid4().hex,
             "source_ip": source_ip[:64],
+            # Unverified proxy header, kept apart from the trusted source_ip.
+            "claimed_ip": claimed_ip[:64],
             "user_agent": user_agent[:256],
             "method": method,
             "path": path[:256],
@@ -442,8 +445,21 @@ def _response_shape(path: str, status_code: int) -> str:
     return "decoy-not-found" if status_code == 404 else "decoy-generic"
 
 
-def install_trap(app: FastAPI, recorder: HoneypotRecorder) -> None:
-    """Register the trap after all real application routes."""
+def _socket_peer(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def install_trap(
+    app: FastAPI,
+    recorder: HoneypotRecorder,
+    *,
+    client_ip: Callable[[Request], str] = _socket_peer,
+) -> None:
+    """Register the trap after all real application routes.
+
+    ``client_ip`` decides which address is trusted as ``source_ip``; the raw
+    cf-connecting-ip header is only recorded as ``claimed_ip``.
+    """
 
     slots = asyncio.Semaphore(2)
 
@@ -470,8 +486,8 @@ def install_trap(app: FastAPI, recorder: HoneypotRecorder) -> None:
             return JSONResponse({"detail": "Not Found"}, status_code=404)
         async with slots:
             await run_blocking(recorder.record,
-            source_ip=request.headers.get("cf-connecting-ip")
-            or (request.client.host if request.client else "unknown"),
+            source_ip=client_ip(request),
+            claimed_ip=request.headers.get("cf-connecting-ip", ""),
             user_agent=request.headers.get("user-agent", ""),
             method=request.method,
             path=path,

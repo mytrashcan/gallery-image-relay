@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import logging
+import random
 from unittest.mock import MagicMock
 
+import pytest
 import requests
 from PIL import Image
 
@@ -166,6 +169,53 @@ class TestProcessImage:
         assert calls == [800, 200]
         assert len(discord_buffer.getvalue()) == 790
         assert len(telegram_buffer.getvalue()) == 190
+
+
+class TestTruncatedImages:
+    @staticmethod
+    def encode(fmt: str, mode: str = "RGB", **kwargs: object) -> bytes:
+        noise = Image.frombytes("RGB", (320, 240), bytes(range(256)) * 900)
+        output = io.BytesIO()
+        noise.convert(mode).save(output, format=fmt, **kwargs)
+        return output.getvalue()
+
+    @pytest.mark.parametrize(("fmt", "kwargs"), [
+        ("JPEG", {}), ("JPEG", {"progressive": True}), ("GIF", {}), ("BMP", {}), ("PNG", {}), ("WEBP", {}),
+    ])
+    def test_truncated_static_image_is_rejected(self, fmt: str, kwargs: dict) -> None:
+        data = self.encode(fmt, **kwargs)
+
+        ImageHandler.validate_image_data(data)
+        with pytest.raises(ValueError):
+            ImageHandler.validate_image_data(data[: len(data) // 2])
+
+    @pytest.mark.parametrize("mode", ["L", "CMYK"])
+    def test_complete_jpeg_in_other_modes_is_accepted(self, mode: str) -> None:
+        ImageHandler.validate_image_data(self.encode("JPEG", mode))
+
+    def test_truncated_animation_is_rejected(self) -> None:
+        data = make_gif_bytes(frames=6, size=(120, 120))
+
+        ImageHandler.validate_image_data(data)
+        with pytest.raises(ValueError):
+            ImageHandler.validate_image_data(data[: len(data) // 2])
+
+    def test_truncated_download_is_a_permanent_rejection(self) -> None:
+        from Module.media_candidate import MediaCandidate
+        from Module.media_download import MediaDownloadRejected, download_media_candidate
+
+        data = self.encode("JPEG")[:-200]
+        response = MagicMock(status_code=200, headers={})
+        response.iter_content.return_value = [data]
+        client = MagicMock()
+        client.get.return_value = response
+
+        with pytest.raises(MediaDownloadRejected):
+            download_media_candidate(
+                client, MediaCandidate("https://dcimg8.dcinside.co.kr/cut.jpg"),
+                is_allowed_url=ImageHandler._is_allowed_dc_image_url,
+                validate=ImageHandler.validate_image_data, timeout=1, max_bytes=10**6,
+            )
 
 
 class TestDownloadImages:
@@ -390,6 +440,34 @@ class TestCompress:
 
         assert size <= target
         assert output.read(6) in (b"GIF87a", b"GIF89a")
+
+    @pytest.mark.parametrize(("mode", "fmt"), [("LA", "PNG"), ("I;16", "PNG"), ("CMYK", "TIFF"), ("1", "PNG")])
+    def test_compress_image_converts_jpeg_incompatible_modes(self, mode: str, fmt: str) -> None:
+        noise = Image.frombytes("RGB", (400, 400), random.Random(1).randbytes(400 * 400 * 3))
+        source = io.BytesIO()
+        noise.convert(mode).save(source, format=fmt)
+        data = source.getvalue()
+        target = len(data) // 2
+
+        output, size = ImageHandler().compress_image(data, target, "image")
+
+        assert size <= target
+        assert output.read(2) == b"\xff\xd8"
+
+    def test_compress_logs_omit_filename_and_report_written_size(self, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="Module.image_handler")
+        handler = ImageHandler()
+        png = make_png_bytes(size=(800, 800))
+        gif = make_gif_bytes(frames=12, size=(400, 400))
+
+        handler.compress_image(png, len(png) // 2, "private-label.png")
+        handler.compress_gif(gif, int(len(gif) * 0.8), "private-label.gif")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(message.startswith("[이미지 압축]") for message in messages)
+        assert any(message.startswith("[GIF 압축]") for message in messages)
+        assert not any("private-label" in message for message in messages)
+        assert not any("-> 0 bytes" in message for message in messages)
 
     def test_compress_image_invalid_data_returns_original(self) -> None:
         handler = ImageHandler()

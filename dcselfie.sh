@@ -31,7 +31,8 @@ TUNNEL="${DC_TUNNEL:-dcgallery}"
 cd "$ROOT"
 WEB_PORT="$("$PY" -c 'from Module.config import app_config; print(app_config.web_port)')"
 STATIC_DIR="$ROOT/web_static"
-MAINT="$ROOT/.maintenance"   # 존재하면 웹 서버가 점검 페이지를 보여줌
+# 존재하면 웹 서버가 점검 페이지를 보여줌. WEB_MAINTENANCE_FILE을 따르도록 웹 앱과 같은 설정에서 읽는다.
+MAINT="$("$PY" -c 'from Module.config import app_config; print(app_config.maintenance_file_path)')"
 
 C_LABEL="win.dcselfie.crawler"
 W_LABEL="win.dcselfie.web"
@@ -114,7 +115,7 @@ cmd_status() {
 }
 
 # 긴급 점검 on/off (웹 서버 재시작 불필요, 즉시 반영)
-cmd_down() { touch "$MAINT"; echo "🛠  점검 모드 ON — https://dcselfie.win 에 점검 페이지가 표시됩니다."; }
+cmd_down() { mkdir -p "$(dirname "$MAINT")"; touch "$MAINT"; echo "🛠  점검 모드 ON — https://dcselfie.win 에 점검 페이지가 표시됩니다."; }
 cmd_up()   { rm -f "$MAINT"; echo "🟢 점검 모드 OFF — 사이트 정상 운영."; }
 
 cmd_logs() { tail -n 40 -F "$LOGS"/crawler.log "$LOGS"/web.log "$LOGS"/tunnel.log 2>/dev/null; }

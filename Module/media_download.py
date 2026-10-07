@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -29,6 +30,43 @@ class MediaDownloadRejected(ValueError):
 
 class MediaDownloadTooLarge(MediaDownloadRejected):
     pass
+
+
+class DownloadDeadlineExceeded(requests.Timeout):
+    """The request chain ran past its wall-clock deadline; retrying cannot help."""
+
+
+class _DeadlineWatchdog:
+    """Shut a response's socket for reading when the deadline passes.
+
+    A body that keeps trickling bytes never trips the per-read socket timeout and
+    ``iter_content`` only returns after a whole chunk, so the deadline cannot be
+    checked between reads. The timer thread only calls urllib3's
+    ``HTTPResponse.shutdown()``: the worker thread's blocked read then fails or ends,
+    and that thread still closes the response and returns, so callers that join it
+    keep owning cleanup.
+    """
+
+    def __init__(self, response: object, deadline: float) -> None:
+        self.fired = threading.Event()
+        self._response = response
+        self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self) -> None:
+        self.fired.set()
+        shutdown = getattr(getattr(self._response, "raw", None), "shutdown", None)
+        if shutdown is None:
+            return
+        try:
+            shutdown()
+        except (OSError, ValueError, RuntimeError):
+            # Already closed or released to the pool: nothing is left to interrupt.
+            pass
+
+    def cancel(self) -> None:
+        self._timer.cancel()
 
 
 class MediaAttemptBudgetExceeded(requests.RequestException):
@@ -72,10 +110,16 @@ def download_limited(
     retry_policy: RetryPolicy | None = None,
     on_attempt: Callable[[], None] | None = None,
     is_allowed_url: Callable[[str], bool] | None = None,
+    deadline_seconds: float | None = None,
 ) -> bytes:
-    """Stream a response into memory while enforcing a hard byte limit."""
+    """Stream a response into memory while enforcing a hard byte limit.
+
+    The whole chain (attempts, redirects, retry waits and body reads) is bounded by
+    ``deadline_seconds``, by default ``max(30, timeout * 4)``. Only the wait for
+    response headers is bounded per read rather than by the watchdog.
+    """
     policy = retry_policy or DEFAULT_MEDIA_RETRY_POLICY
-    deadline = time.monotonic() + max(30.0, timeout * 4)
+    deadline = time.monotonic() + (deadline_seconds if deadline_seconds is not None else max(30.0, timeout * 4))
     for attempt in range(1, policy.max_attempts + 1):
         if on_attempt is not None:
             on_attempt()
@@ -85,13 +129,15 @@ def download_limited(
         try:
             current_url = url
             for redirect in range(4):
-                if time.monotonic() >= deadline:
-                    raise requests.Timeout("download deadline exceeded")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DownloadDeadlineExceeded("download deadline exceeded")
                 if is_allowed_url is not None and not is_allowed_url(current_url):
                     raise MediaDownloadRejected("request destination rejected")
                 if redirect and on_attempt is not None:
                     on_attempt()
-                response = client.get(current_url, headers=headers, timeout=timeout, stream=True, allow_redirects=False)
+                response = client.get(current_url, headers=headers, timeout=min(timeout, remaining),
+                                      stream=True, allow_redirects=False)
                 if getattr(response, "status_code", None) not in {301, 302, 303, 307, 308}:
                     break
                 location = response.headers.get("location")
@@ -100,41 +146,16 @@ def download_limited(
                 current_url = urljoin(current_url, location)
                 response.close()
                 response = None
-            status = getattr(response, "status_code", None)
-            content_type = response.headers.get("content-type", "")
-            if status in {403, 503} and "html" in content_type.casefold():
-                challenge_body = next(
-                    iter(response.iter_content(chunk_size=min(chunk_size, 128 * 1024))),
-                    b"",
-                )
-                raise_for_cloudflare_challenge(response, body=challenge_body)
-            response.raise_for_status()
-
-            content_length = response.headers.get("content-length")
-            if content_length:
-                try:
-                    declared_size = int(content_length)
-                except ValueError as exc:
-                    raise MediaDownloadRejected("invalid content-length") from exc
-                if declared_size < 0:
-                    raise MediaDownloadRejected("invalid content-length")
-                if declared_size > max_bytes:
-                    raise MediaDownloadTooLarge("media exceeds download limit")
-
-            data = bytearray()
-            challenge_candidate = "html" in content_type.casefold()
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if time.monotonic() >= deadline:
-                    raise requests.Timeout("download deadline exceeded")
-                if not chunk:
-                    continue
-                if len(data) + len(chunk) > max_bytes:
-                    raise MediaDownloadTooLarge("media exceeds download limit")
-                data.extend(chunk)
-                if challenge_candidate and len(data) <= 128 * 1024:
-                    raise_for_cloudflare_challenge(response, body=bytes(data))
-            return bytes(data)
-        except (MediaDownloadRejected, BlockedByChallenge):
+            watchdog = _DeadlineWatchdog(response, deadline)
+            try:
+                return _read_body(response, chunk_size, max_bytes, deadline)
+            except Exception as exc:
+                if watchdog.fired.is_set() and not isinstance(exc, DownloadDeadlineExceeded):
+                    raise DownloadDeadlineExceeded("download deadline exceeded") from exc
+                raise
+            finally:
+                watchdog.cancel()
+        except (MediaDownloadRejected, BlockedByChallenge, DownloadDeadlineExceeded):
             raise
         except requests.RequestException as exc:
             decision = classify_exception(exc, policy)
@@ -149,12 +170,55 @@ def download_limited(
             if retry_response is None:
                 retry_response = response
             delay = retry_delay(attempt, policy, retry_response)
+            if time.monotonic() + delay >= deadline:
+                raise DownloadDeadlineExceeded("download deadline exceeded") from exc
         finally:
             if response is not None:
                 response.close()
         sleep_sync(delay)
 
     raise RuntimeError("unreachable retry loop")
+
+
+def _read_body(response: object, chunk_size: int, max_bytes: int, deadline: float) -> bytes:
+    status = getattr(response, "status_code", None)
+    content_type = response.headers.get("content-type", "")
+    if status in {403, 503} and "html" in content_type.casefold():
+        challenge_body = next(
+            iter(response.iter_content(chunk_size=min(chunk_size, 128 * 1024))),
+            b"",
+        )
+        raise_for_cloudflare_challenge(response, body=challenge_body)
+    response.raise_for_status()
+
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError as exc:
+            raise MediaDownloadRejected("invalid content-length") from exc
+        if declared_size < 0:
+            raise MediaDownloadRejected("invalid content-length")
+        if declared_size > max_bytes:
+            raise MediaDownloadTooLarge("media exceeds download limit")
+
+    data = bytearray()
+    challenge_candidate = "html" in content_type.casefold()
+    for chunk in response.iter_content(chunk_size=chunk_size):
+        if time.monotonic() >= deadline:
+            raise DownloadDeadlineExceeded("download deadline exceeded")
+        if not chunk:
+            continue
+        if len(data) + len(chunk) > max_bytes:
+            raise MediaDownloadTooLarge("media exceeds download limit")
+        data.extend(chunk)
+        if challenge_candidate and len(data) <= 128 * 1024:
+            raise_for_cloudflare_challenge(response, body=bytes(data))
+    if time.monotonic() >= deadline:
+        # A body cut short by the watchdog can end without an error when no
+        # Content-Length was sent; never return it as a complete download.
+        raise DownloadDeadlineExceeded("download deadline exceeded")
+    return bytes(data)
 
 
 def image_extension_from_data(image_data: bytes) -> str:
