@@ -417,7 +417,9 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
                 return JSONResponse({"error": "invalid image"}, status_code=415)
             except ImageTooLarge:
                 return JSONResponse({"error": "image too large"}, status_code=413)
-        return JSONResponse(item)
+        # The store returns {} for a recent duplicate; say so explicitly, because the
+        # crawler-side client also reports a failed upload as {}.
+        return JSONResponse(item or {"duplicate": True})
 
     @app.get("/images/{image_id}")
     async def image(image_id: str, thumbnail: bool = False) -> Response:

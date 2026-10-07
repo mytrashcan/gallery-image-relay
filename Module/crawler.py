@@ -14,6 +14,7 @@ from Module.delivery_archive import DeliveryArchive, post_key
 # BoundedSet 은 공통 LRUCache 로 통합됨 — 기존 import(arca_crawler/테스트) 호환 위해 재노출
 from Module.lru_cache import BoundedSet, LRUCache  # noqa: F401
 from Module.page_fetch import SourcePageGone, fetch_page
+from Module.post_retry import PostRetrySchedule, log_deferred_post
 from Module.retry_policy import (
     BlockedByChallenge,
     RetryPolicy,
@@ -54,9 +55,11 @@ class DCInsideCrawler:
         retry_policy: RetryPolicy | None = None,
         gallery_name: str = "",
         delivery_archive: DeliveryArchive | None = None,
+        post_retry: PostRetrySchedule | None = None,
     ) -> None:
         self.base_url = base_url
         self.sent_post_ids = LRUCache(MAX_CACHE_SIZE)
+        self.post_retry = post_retry if post_retry is not None else PostRetrySchedule()
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.retry_policy = retry_policy or _PAGE_RETRY_POLICY
@@ -118,7 +121,10 @@ class DCInsideCrawler:
                     logger.warning(f"게시글 파싱 실패: {type(e).__name__}")
                     continue
 
-            return min(eligible, key=lambda item: int(item["post_id"])) if eligible else None
+            self.post_retry.retain(item["post_id"] for item in eligible)
+            # A post waiting out its retry backoff must not block newer eligible posts.
+            due = [item for item in eligible if self.post_retry.is_due(item["post_id"])]
+            return min(due, key=lambda item: int(item["post_id"])) if due else None
 
         except BlockedByChallenge:
             logger.warning("DCInside Cloudflare challenge 감지: %s", self.base_url)
@@ -139,6 +145,12 @@ class DCInsideCrawler:
                 post_key(post_id),
             )
         self.sent_post_ids.add(post_id)
+        self.post_retry.clear(post_id)
+
+    def mark_failed(self, post_id: str) -> None:
+        """Defer an unacknowledged post so newer posts proceed while it waits."""
+        state = self.post_retry.record_failure(post_id)
+        log_deferred_post("dcinside", self.gallery_name, post_id, state)
 
     def _has_sent(self, post_id: str) -> bool:
         if post_id in self.sent_post_ids:

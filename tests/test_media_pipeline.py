@@ -555,3 +555,126 @@ def test_web_image_uses_original_only_within_ingest_limit(monkeypatch) -> None:
         discord_buffer=compressed,
         original_data=b"x" * (1024 * 1024 + 1),
     )) == b"compressed"
+
+
+async def publish_twice(pipeline: MediaPipeline, media_id: str = "hash-a") -> tuple[DeliveryResult, DeliveryResult]:
+    first = await pipeline.attach_to_web_gallery(b"image", "a.jpg", 0, "title", "link", media_id=media_id)
+    await pipeline._web_queue.join()
+    second = await pipeline.attach_to_web_gallery(b"image", "a.jpg", 0, "title", "link", media_id=media_id)
+    await pipeline._web_queue.join()
+    return first, second
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [{"id": "x.jpg"}, {"duplicate": True}])
+async def test_confirmed_web_publish_is_not_repeated(response) -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [], web_gallery_enabled=True)
+    pipeline.gallery_client.publish_async = AsyncMock(return_value=response)
+
+    first, second = await publish_twice(pipeline)
+
+    assert first.deliveries[0].outcome is DeliveryOutcome.QUEUED
+    assert second.deliveries[0].outcome is DeliveryOutcome.SUCCEEDED
+    assert second.deliveries[0].reason == "already_published"
+    assert second.deliveries[0].ack_eligible is False
+    pipeline.gallery_client.publish_async.assert_awaited_once()
+    await pipeline.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [AsyncMock(return_value={}), AsyncMock(side_effect=RuntimeError("down"))])
+async def test_failed_web_publish_stays_retryable(failure) -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [], web_gallery_enabled=True)
+    pipeline.gallery_client.publish_async = failure
+
+    first, second = await publish_twice(pipeline)
+
+    assert first.deliveries[0].outcome is DeliveryOutcome.QUEUED
+    assert second.deliveries[0].outcome is DeliveryOutcome.QUEUED
+    assert failure.await_count == 2
+    assert pipeline._web_pending_bytes == 0
+    await pipeline.close()
+
+
+@pytest.mark.asyncio
+async def test_media_already_queued_is_not_queued_twice() -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [], web_gallery_enabled=True)
+    release = asyncio.Event()
+
+    async def slow_publish(*args, **kwargs):
+        await release.wait()
+        return {"id": "x"}
+
+    pipeline.gallery_client.publish_async = slow_publish
+    await pipeline.attach_to_web_gallery(b"image", "a.jpg", 0, "", "", media_id="hash-a")
+    second = await pipeline.attach_to_web_gallery(b"image", "a.jpg", 0, "", "", media_id="hash-a")
+
+    assert second.deliveries[0].outcome is DeliveryOutcome.SKIPPED
+    assert second.deliveries[0].reason == "already_queued"
+    assert pipeline._web_pending_bytes == len(b"image")
+    release.set()
+    await pipeline.close()
+    assert pipeline._web_pending_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_close_drains_queued_media_state(monkeypatch) -> None:
+    pipeline = MediaPipeline(MagicMock(), MagicMock(), [], web_gallery_enabled=True)
+    never = asyncio.Event()
+
+    async def stuck_publish(*args, **kwargs):
+        await never.wait()
+
+    pipeline.gallery_client.publish_async = stuck_publish
+    for media_id in ("hash-a", "hash-b"):
+        await pipeline.attach_to_web_gallery(b"image", "a.jpg", 0, "", "", media_id=media_id)
+
+    async def join_times_out(awaitable, timeout):
+        awaitable.close()
+        raise TimeoutError
+
+    monkeypatch.setattr("Module.media_pipeline.asyncio.wait_for", join_times_out)
+
+    await pipeline.close()
+
+    assert pipeline._web_queued == set()
+    assert pipeline._web_pending_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_retried_dc_post_is_published_to_web_feed_once() -> None:
+    """A post retried past the store's 300 s duplicate window must not reappear in the feed."""
+    from PIL import Image
+
+    from Module.memory_gallery import MemoryGalleryStore
+
+    now = [0.0]
+    store = MemoryGalleryStore(
+        max_items=10, max_bytes=10_000_000, max_image_bytes=5_000_000, ttl_seconds=3600, clock=lambda: now[0],
+    )
+    png = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(png, format="PNG")
+    sender = MagicMock()
+    sender.telegram_chat_id = "telegram-chat"
+    sender.send_discord_payload = AsyncMock(side_effect=successful_discord_payload)
+    sender.send_to_telegram = AsyncMock(return_value=False)
+    client = MagicMock()
+    client.get_channel.return_value = MagicMock()
+    pipeline = MediaPipeline(sender, client, [111], web_gallery_enabled=True, web_gallery_name="cats")
+
+    async def publish_to_store(data, filename, *, title="", link="", gallery=""):
+        return store.put(data, filename, title, link, gallery)
+
+    pipeline.gallery_client.publish_async = publish_to_store
+    for retry_at in (0, 100, 301):
+        now[0] = retry_at
+        result = await pipeline.distribute([prepared_media(
+            "a.png", "hash-a", discord_buffer=io.BytesIO(png.getvalue()), original_data=png.getvalue(), validated=True,
+        )])
+        await pipeline._web_queue.join()
+        assert result.acknowledged is False
+
+    assert store.stats()["items"] == 1
+    assert sender.send_discord_payload.await_count == 1
+    assert sender.send_to_telegram.await_count == 3
+    await pipeline.close()

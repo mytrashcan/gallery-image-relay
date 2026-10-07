@@ -8,6 +8,7 @@ from PIL import Image
 
 from Module.delivery_archive import DeliveryArchive, image_key
 from Module.image_handler import (
+    MAX_DC_IMAGE_ELEMENTS,
     MAX_HASH_CACHE_SIZE,
     ImageHandler,
 )
@@ -282,6 +283,91 @@ class TestDownloadImages:
         assert handler.download_images(
             "https://gall.dcinside.com/mgallery/board/view/?id=test&no=1"
         ) == []
+
+
+class TestDownloadImagesFallthrough:
+    POST_URL = "https://gall.dcinside.com/mgallery/board/view/?id=test&no=1"
+
+    @staticmethod
+    def response(body: bytes) -> MagicMock:
+        response = MagicMock(status_code=200)
+        response.headers = {"content-length": str(len(body))}
+        response.iter_content.return_value = [body]
+        return response
+
+    def make_handler(self, html: str, *image_bodies: bytes) -> ImageHandler:
+        handler = ImageHandler()
+        handler.session = MagicMock()
+        handler.session.get.side_effect = [self.response(html.encode())] + [
+            self.response(body) for body in image_bodies
+        ]
+        return handler
+
+    def test_external_first_inline_image_falls_through_to_allowed_image(self) -> None:
+        html = (
+            '<div class="writing_view_box">'
+            '<img src="https://i.example.org/external.png">'
+            '<img src="https://dcimg8.dcinside.co.kr/allowed.png"></div>'
+        )
+        handler = self.make_handler(html, make_png_bytes())
+
+        images = handler.download_images(self.POST_URL)
+
+        assert images[0][2] == "allowed.png"
+        assert handler.session.get.call_count == 2
+
+    def test_invalid_first_image_falls_through_to_next(self) -> None:
+        html = (
+            '<div class="writing_view_box">'
+            '<img src="https://dcimg8.dcinside.co.kr/broken.png">'
+            '<img src="https://dcimg8.dcinside.co.kr/valid.png"></div>'
+        )
+        handler = self.make_handler(html, b"not an image", make_png_bytes())
+
+        images = handler.download_images(self.POST_URL)
+
+        assert images[0][2] == "valid.png"
+        assert handler.session.get.call_args_list[2].args[0].endswith("valid.png")
+
+    def test_all_rejected_images_resolve_post(self) -> None:
+        html = (
+            '<div class="writing_view_box">'
+            '<img src="https://i.example.org/a.png"><img src="https://dcimg8.dcinside.co.kr/b.png"></div>'
+        )
+        handler = self.make_handler(html, b"not an image")
+
+        assert handler.download_images(self.POST_URL) == []
+
+    def test_transient_failure_retries_post_instead_of_skipping_image(self, monkeypatch) -> None:
+        monkeypatch.setattr("Module.media_download.sleep_sync", lambda *args, **kwargs: None)
+        html = (
+            '<div class="writing_view_box">'
+            '<img src="https://dcimg8.dcinside.co.kr/first.png">'
+            '<img src="https://dcimg8.dcinside.co.kr/second.png"></div>'
+        )
+        handler = ImageHandler()
+        handler.session = MagicMock()
+        handler.session.get.side_effect = [self.response(html.encode())] + [
+            requests.ConnectionError("down")
+        ] * 6
+
+        assert handler.download_images(self.POST_URL) is None
+        assert all(
+            call.args[0].endswith("first.png") for call in handler.session.get.call_args_list[1:]
+        )
+
+    def test_tried_image_elements_are_bounded(self) -> None:
+        externals = "".join(
+            f'<img src="https://i.example.org/{i}.png">' for i in range(MAX_DC_IMAGE_ELEMENTS)
+        )
+        html = (
+            f'<div class="writing_view_box">{externals}'
+            '<img src="https://dcimg8.dcinside.co.kr/late.png"></div>'
+        )
+        handler = self.make_handler(html, make_png_bytes())
+
+        assert handler.download_images(self.POST_URL) == []
+        assert handler.session.get.call_count == 1
 
 
 class TestCompress:

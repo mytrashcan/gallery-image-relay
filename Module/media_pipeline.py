@@ -62,6 +62,11 @@ class MediaPipeline:
         self.source = source
         self.gallery_name = gallery_name
         self._receipts = LRUCache(2000)
+        # Web gallery publishes are best effort and RAM-only, so their state stays in
+        # memory: confirmed media are not re-published on a post retry, and media still
+        # queued are not queued twice. A failed or dropped publish stays retryable.
+        self._web_published = LRUCache(2000)
+        self._web_queued: set[str] = set()
 
     def _delivered(self, transport: str, destination: str, media_id: str) -> bool:
         key = destination_key(transport, destination, media_id)
@@ -92,15 +97,20 @@ class MediaPipeline:
     async def _web_worker(self) -> None:
         assert self._web_queue is not None
         while True:
-            args = await self._web_queue.get()
+            args, kwargs, web_key = await self._web_queue.get()
+            published = False
             try:
-                await self.gallery_client.publish_async(*args[0], **args[1])
+                # Non-empty JSON means stored, or already present as a recent duplicate.
+                published = bool(await self.gallery_client.publish_async(*args, **kwargs))
             except Exception as exc:
                 logger.warning("웹 갤러리 백그라운드 전송 실패: %s", type(exc).__name__)
             finally:
-                self._web_pending_bytes -= len(args[0][0])
+                self._web_queued.discard(web_key)
+                if published:
+                    self._web_published.add(web_key)
+                self._web_pending_bytes -= len(args[0])
                 self._web_queue.task_done()
-                del args
+                del args, kwargs
 
     def _get_channel(self, channel_id, *, warn_missing: bool = False):
         channel = self.client.get_channel(int(channel_id))
@@ -123,31 +133,30 @@ class MediaPipeline:
     ) -> DeliveryResult:
         """WEB_GALLERY=1 이면 이미지를 공유 웹 갤러리에 적재한다."""
         requested_media = (media_id or filename,)
-        destination_id = self.web_gallery_name
+        web_key = requested_media[0]
+
+        def web_result(outcome: DeliveryOutcome, reason: str | None = None) -> DeliveryResult:
+            delivered = requested_media if outcome is DeliveryOutcome.SUCCEEDED else ()
+            return DeliveryResult((
+                ChannelDelivery(
+                    transport="web_gallery",
+                    destination_id=self.web_gallery_name,
+                    outcome=outcome,
+                    requested_media=requested_media,
+                    delivered_media=delivered,
+                    ack_eligible=False,
+                    reason=reason,
+                ),
+            ))
+
         if not self.gallery_client:
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="web_gallery",
-                    destination_id=destination_id,
-                    outcome=DeliveryOutcome.SKIPPED,
-                    requested_media=requested_media,
-                    delivered_media=(),
-                    ack_eligible=False,
-                    reason="gallery_disabled",
-                ),
-            ))
+            return web_result(DeliveryOutcome.SKIPPED, "gallery_disabled")
         if not data or self._closed:
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="web_gallery",
-                    destination_id=destination_id,
-                    outcome=DeliveryOutcome.SKIPPED,
-                    requested_media=requested_media,
-                    delivered_media=(),
-                    ack_eligible=False,
-                    reason="empty_media",
-                ),
-            ))
+            return web_result(DeliveryOutcome.SKIPPED, "empty_media")
+        if web_key in self._web_published:
+            return web_result(DeliveryOutcome.SUCCEEDED, "already_published")
+        if web_key in self._web_queued:
+            return web_result(DeliveryOutcome.SKIPPED, "already_queued")
         self._ensure_web_worker()
         assert self._web_queue is not None
         payload = (
@@ -157,6 +166,7 @@ class MediaPipeline:
                 "link": link if global_idx == 0 else "",
                 "gallery": self.web_gallery_name,
             },
+            web_key,
         )
         try:
             from Module.config import app_config
@@ -166,29 +176,11 @@ class MediaPipeline:
                 raise asyncio.QueueFull
             self._web_queue.put_nowait(payload)
             self._web_pending_bytes += len(data)
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="web_gallery",
-                    destination_id=destination_id,
-                    outcome=DeliveryOutcome.QUEUED,
-                    requested_media=requested_media,
-                    delivered_media=(),
-                    ack_eligible=False,
-                ),
-            ))
+            self._web_queued.add(web_key)
+            return web_result(DeliveryOutcome.QUEUED)
         except asyncio.QueueFull:
             logger.warning("Web gallery queue capacity exceeded")
-            return DeliveryResult((
-                ChannelDelivery(
-                    transport="web_gallery",
-                    destination_id=destination_id,
-                    outcome=DeliveryOutcome.FAILED,
-                    requested_media=requested_media,
-                    delivered_media=(),
-                    ack_eligible=False,
-                    reason="queue_full",
-                ),
-            ))
+            return web_result(DeliveryOutcome.FAILED, "queue_full")
 
     @staticmethod
     def _web_image_data(image_item: PreparedMedia) -> bytes:
@@ -431,8 +423,9 @@ class MediaPipeline:
             await asyncio.gather(self._web_worker_task, return_exceptions=True)
         if self._web_queue is not None:
             while not self._web_queue.empty():
-                payload = self._web_queue.get_nowait()
-                self._web_pending_bytes -= len(payload[0][0])
+                (data, _), _, web_key = self._web_queue.get_nowait()
+                self._web_pending_bytes -= len(data)
+                self._web_queued.discard(web_key)
                 self._web_queue.task_done()
         if self.gallery_client is not None:
             self.gallery_client.close()

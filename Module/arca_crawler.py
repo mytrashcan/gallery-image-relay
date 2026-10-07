@@ -20,6 +20,7 @@ from Module.delivery_archive import DeliveryArchive, post_key
 from Module.lru_cache import LRUCache
 from Module.media_candidate import MediaCandidate
 from Module.page_fetch import SourcePageGone, fetch_page
+from Module.post_retry import PostRetrySchedule, log_deferred_post
 from Module.retry_policy import (
     BlockedByChallenge,
     RetryPolicy,
@@ -211,9 +212,11 @@ class ArcaliveCrawler:
         retry_policy: RetryPolicy | None = None,
         gallery_name: str = "",
         delivery_archive: DeliveryArchive | None = None,
+        post_retry: PostRetrySchedule | None = None,
     ) -> None:
         self.base_url = base_url
         self.sent_items = LRUCache()
+        self.post_retry = post_retry if post_retry is not None else PostRetrySchedule()
         self.session = session or _create_session()
         self.retry_policy = retry_policy or _PAGE_RETRY_POLICY
         self.gallery_name = gallery_name
@@ -256,7 +259,10 @@ class ArcaliveCrawler:
             if not self._has_sent(post["post_id"]):
                 new_posts.append(post)
 
-        return sorted(new_posts, key=lambda post: int(post["post_id"]))[:max_posts]
+        self.post_retry.retain(post["post_id"] for post in new_posts)
+        # Posts waiting out their retry backoff must not occupy the per-cycle slots.
+        due = [post for post in new_posts if self.post_retry.is_due(post["post_id"])]
+        return sorted(due, key=lambda post: int(post["post_id"]))[:max_posts]
 
     def mark_sent(self, post_id: str) -> None:
         """Acknowledge a post only after delivery succeeds."""
@@ -267,6 +273,12 @@ class ArcaliveCrawler:
                 post_key(post_id),
             )
         self.sent_items.add(post_id)
+        self.post_retry.clear(post_id)
+
+    def mark_failed(self, post_id: str) -> None:
+        """Defer an unacknowledged post so newer posts proceed while it waits."""
+        state = self.post_retry.record_failure(post_id)
+        log_deferred_post("arcalive", self.gallery_name, post_id, state)
 
     def _has_sent(self, post_id: str) -> bool:
         if post_id in self.sent_items:

@@ -177,7 +177,8 @@ def test_duplicate_content_is_suppressed(monkeypatch, tmp_path):
     data = image_bytes()
 
     assert ingest(client, data, "first.png").json()
-    assert ingest(client, data, "second.png").json() == {}
+    assert ingest(client, data, "second.png").json() == {"duplicate": True}
+    assert len(client.get("/feed").json()) == 1
 
 
 def test_like_state_is_kept_in_memory(monkeypatch, tmp_path):

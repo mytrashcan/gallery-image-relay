@@ -97,8 +97,15 @@ class DCBot(discord.Client):
                 post = await run_blocking(self.crawler.get_latest_post)
                 if post:
                     logger.info("post selected source=dcinside gallery=%s post_id=%s", self.gallery_name, post["post_id"])
-                    if not post['has_image'] or await self.process_post(post):
+                    try:
+                        delivered = not post['has_image'] or await self.process_post(post)
+                    except Exception:
+                        self.crawler.mark_failed(post["post_id"])
+                        raise
+                    if delivered:
                         self.crawler.mark_sent(post["post_id"])
+                    else:
+                        self.crawler.mark_failed(post["post_id"])
             except discord.ConnectionClosed:
                 logger.warning("Discord 연결이 끊어졌습니다. 재연결 대기 중...")
                 await asyncio.sleep(5)
