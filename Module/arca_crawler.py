@@ -216,7 +216,7 @@ class ArcaliveCrawler:
     ) -> None:
         self.base_url = base_url
         self.sent_items = LRUCache()
-        self.post_retry = post_retry or PostRetrySchedule()
+        self.post_retry = post_retry if post_retry is not None else PostRetrySchedule()
         self.session = session or _create_session()
         self.retry_policy = retry_policy or _PAGE_RETRY_POLICY
         self.gallery_name = gallery_name

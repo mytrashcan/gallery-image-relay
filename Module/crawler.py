@@ -59,7 +59,7 @@ class DCInsideCrawler:
     ) -> None:
         self.base_url = base_url
         self.sent_post_ids = LRUCache(MAX_CACHE_SIZE)
-        self.post_retry = post_retry or PostRetrySchedule()
+        self.post_retry = post_retry if post_retry is not None else PostRetrySchedule()
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.retry_policy = retry_policy or _PAGE_RETRY_POLICY

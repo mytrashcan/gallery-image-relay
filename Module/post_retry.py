@@ -49,7 +49,8 @@ class PostRetrySchedule:
     def record_failure(self, post_id: str) -> RetryState:
         previous = self._states.get(post_id)
         attempts = (previous.attempts if previous else 0) + 1
-        delay = min(self._max_delay, self._base_delay * 2 ** (attempts - 1))
+        # Cap the exponent: the delay saturates long before, and 2 ** 1024 overflows a float.
+        delay = min(self._max_delay, self._base_delay * 2 ** min(attempts - 1, 32))
         state = RetryState(attempts=attempts, delay=delay, retry_at=self._clock() + delay)
         self._states[post_id] = state
         return state
