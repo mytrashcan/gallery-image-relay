@@ -310,7 +310,7 @@ Notes for small instances (1 GB RAM free tier):
 | `WEB_GALLERY_URL` | env | `http://127.0.0.1:8000` | Internal web-gallery origin |
 | `WEB_STATIC_DIR` | env | `web_static` | Directory for HTML/CSS/static assets only |
 | `WEB_THUMB_WIDTH` | env | 480 | In-memory card-thumbnail width (`0` disables) |
-| `WEB_MAINTENANCE` | env | unset | Set to `1` to force the maintenance page (`503`). A `.maintenance` flag file next to the project (toggled by `./dcselfie.sh down` / `up`, no restart needed) has the same effect |
+| `WEB_MAINTENANCE` | env | unset | Set to `1` to force the maintenance page (`503`). A `.maintenance` flag file next to the project, or the path set in `WEB_MAINTENANCE_FILE`, has the same effect; `./dcselfie.sh down` / `up` toggle that same path (no restart needed) |
 | `ARCA_SOCKS_PROXY` | `.env` (never commit) | unset | `socks5://...` proxy the Arcalive crawler routes through - see "Arcalive Cloudflare bypass" below |
 | `ARCA_DOWNLOAD_CONCURRENCY` | env | 2 | Bounded concurrent Arcalive CDN downloads per crawler |
 | `MEDIA_DOWNLOAD_MAX_MB` | env | 15 | Hard streaming limit for each source image download |
