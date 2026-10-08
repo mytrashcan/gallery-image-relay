@@ -32,6 +32,10 @@ class ImageTooLarge(ValueError):
     pass
 
 
+class LikeReceiptCapacity(RuntimeError):
+    pass
+
+
 @dataclass
 class StoredImage:
     image_id: str
@@ -80,19 +84,23 @@ class MemoryGalleryStore:
         max_image_bytes: int,
         ttl_seconds: int,
         thumbnail_width: int = 480,
+        max_like_receipts: int = 5000,
         clock=time.time,
     ):
-        if min(max_items, max_bytes, max_image_bytes, ttl_seconds) <= 0:
+        if min(max_items, max_bytes, max_image_bytes, ttl_seconds, max_like_receipts) <= 0:
             raise ValueError("memory gallery limits must be positive")
         self.max_items = max_items
         self.max_bytes = max_bytes
         self.max_image_bytes = min(max_image_bytes, max_bytes)
         self.ttl_seconds = ttl_seconds
         self.thumbnail_width = max(0, thumbnail_width)
+        self.max_like_receipts = max_like_receipts
         self._clock = clock
         self._items: OrderedDict[str, StoredImage] = OrderedDict()
         self._recent_hashes: dict[str, float] = {}
         self._bytes = 0
+        self._like_voters: dict[str, set[str]] = {}
+        self._like_receipt_count = 0
         self._lock = threading.RLock()
         self.started_at = clock()
 
@@ -157,12 +165,26 @@ class MemoryGalleryStore:
             item = self._items.get(image_id)
             return item.likes if item else None
 
-    def increment_likes(self, image_id: str) -> int | None:
+    def like_once(self, image_id: str, voter_id: str) -> int | None:
+        """Keep each accepted vote receipt until its image leaves the store.
+
+        At capacity, reject new votes rather than forget protection for live images.
+        Existence, receipt admission and the increment share the image lifecycle lock.
+        """
         with self._lock:
             self._purge_locked(self._clock())
             item = self._items.get(image_id)
             if item is None:
                 return None
+            voters = self._like_voters.get(image_id)
+            if voters is not None and voter_id in voters:
+                return item.likes
+            if self._like_receipt_count >= self.max_like_receipts:
+                raise LikeReceiptCapacity("like receipt capacity reached")
+            if voters is None:
+                voters = self._like_voters[image_id] = set()
+            voters.add(voter_id)
+            self._like_receipt_count += 1
             item.likes += 1
             return item.likes
 
@@ -185,6 +207,8 @@ class MemoryGalleryStore:
             self._items.clear()
             self._recent_hashes.clear()
             self._bytes = 0
+            self._like_voters.clear()
+            self._like_receipt_count = 0
 
     def _prepare(self, data: bytes) -> tuple[bytes, str, str, int, int, bytes | None, str | None]:
         try:
@@ -249,3 +273,4 @@ class MemoryGalleryStore:
     def _evict_oldest_locked(self) -> None:
         _, item = self._items.popitem(last=False)
         self._bytes -= item.memory_bytes
+        self._like_receipt_count -= len(self._like_voters.pop(item.image_id, ()))

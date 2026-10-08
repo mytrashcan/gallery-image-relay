@@ -20,8 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from honeypot_trap import HoneypotRecorder, install_trap
 from Module.config import app_config
 from Module.lifecycle import run_blocking
-from Module.lru_cache import LRUCache
-from Module.memory_gallery import ImageTooLarge, InvalidImage, MemoryGalleryStore
+from Module.memory_gallery import ImageTooLarge, InvalidImage, LikeReceiptCapacity, MemoryGalleryStore
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,6 @@ def _purge_legacy_disk_cache() -> None:
 
 # 클라이언트 localStorage 기반 1회 제한은 우회 가능하므로(스크립트로 반복 호출),
 # 서버에서도 IP 기준 최소 방어선을 둔다: (IP, 이미지) 조합당 1회 + IP당 분당 호출 수 제한.
-_like_ip_seen = LRUCache(5000)
 _like_ip_rate: dict[str, tuple[int, float]] = {}
 _LIKE_RATE_WINDOW = 60.0
 _LIKE_RATE_MAX = 30
@@ -493,12 +491,10 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         ip = _client_ip(request)
         if _rate_limited(_like_ip_rate, ip, _LIKE_RATE_WINDOW, _LIKE_RATE_MAX):
             return JSONResponse({"error": "too many requests"}, status_code=429)
-        if _like_ip_seen.add_if_absent((ip, image_id)):
-            n = gallery_store.likes(image_id)
-            if n is None:
-                return JSONResponse({"error": "not found"}, status_code=404)
-            return JSONResponse({"id": image_id, "likes": n})
-        n = gallery_store.increment_likes(image_id)
+        try:
+            n = gallery_store.like_once(image_id, ip)
+        except LikeReceiptCapacity:
+            return JSONResponse({"error": "likes busy"}, status_code=503)
         if n is None:
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse({"id": image_id, "likes": n})
