@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,7 +11,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import web_app
-from Module.memory_gallery import MemoryGalleryStore
+from Module.memory_gallery import LikeReceiptCapacity, MemoryGalleryStore
 from web_app import create_app
 
 
@@ -19,13 +21,14 @@ def image_bytes(size=(64, 64), *, fmt="PNG", color="#336699") -> bytes:
     return output.getvalue()
 
 
-def make_store(*, clock=None, max_items=10, max_bytes=1024 * 1024, ttl=3600, thumb=480):
+def make_store(*, clock=None, max_items=10, max_bytes=1024 * 1024, ttl=3600, thumb=480, max_like_receipts=5000):
     return MemoryGalleryStore(
         max_items=max_items,
         max_bytes=max_bytes,
         max_image_bytes=max_bytes,
         ttl_seconds=ttl,
         thumbnail_width=thumb,
+        max_like_receipts=max_like_receipts,
         clock=clock or __import__("time").time,
     )
 
@@ -36,7 +39,6 @@ def make_client(monkeypatch, tmp_path, store=None) -> tuple[TestClient, MemoryGa
     monkeypatch.setattr(web_app.app_config, "web_static_dir", str(static_dir))
     monkeypatch.setattr(web_app.app_config, "web_ingest_token", "test-secret")
     monkeypatch.setattr(web_app.app_config, "turnstile_secret", "")
-    monkeypatch.setattr(web_app, "_like_ip_seen", web_app.LRUCache(100))
     monkeypatch.setattr(web_app, "_like_ip_rate", {})
     monkeypatch.setattr(web_app, "_feed_ip_rate", {})
     gallery_store = store or make_store()
@@ -215,6 +217,114 @@ def test_like_state_is_kept_in_memory(monkeypatch, tmp_path):
 
     assert first.json()["likes"] == 1
     assert second.json()["likes"] == 1
+
+
+def test_missing_like_ids_do_not_forget_live_votes_or_consume_capacity(monkeypatch, tmp_path):
+    now = [1000.0]
+    store = make_store(clock=lambda: now[0], ttl=10800, max_like_receipts=2)
+    client, _ = make_client(monkeypatch, tmp_path, store)
+    monkeypatch.setattr(web_app.time, "time", lambda: now[0])
+    first = ingest(client, image_bytes(color="red")).json()
+    second = ingest(client, image_bytes(color="blue")).json()
+    assert client.post(f"/like/{first['id']}").json()["likes"] == 1
+
+    # The old test fixture's 100-entry LRU loses the first successful receipt.
+    for index in range(101):
+        if index % 30 == 0:
+            now[0] += 61
+        assert client.post(f"/like/missing-{index}").status_code == 404
+    now[0] += 61
+
+    assert client.post(f"/like/{first['id']}").json()["likes"] == 1
+    assert client.post(f"/like/{second['id']}").json()["likes"] == 1
+
+
+def test_like_capacity_returns_retryable_error_without_forgetting_votes(monkeypatch, tmp_path):
+    store = make_store(max_like_receipts=1)
+    client, _ = make_client(monkeypatch, tmp_path, store)
+    first = ingest(client, image_bytes(color="red")).json()
+    second = ingest(client, image_bytes(color="blue")).json()
+
+    assert client.post(f"/like/{first['id']}").json()["likes"] == 1
+    busy = client.post(f"/like/{second['id']}")
+    assert busy.status_code == 503
+    assert busy.json() == {"error": "likes busy"}
+    assert client.post("/like/missing").status_code == 404
+    assert client.post(f"/like/{first['id']}").json() == {"id": first["id"], "likes": 1}
+    assert store.likes(second["id"]) == 0
+
+    store.clear()
+    replacement = ingest(client, image_bytes(color="blue")).json()
+    assert client.post(f"/like/{replacement['id']}").json()["likes"] == 1
+
+
+def test_valid_vote_pressure_preserves_receipts_and_same_voter_can_like_other_images():
+    store = make_store(max_like_receipts=2)
+    first = store.put(image_bytes(color="red"), "first.png")
+    second = store.put(image_bytes(color="blue"), "second.png")
+    assert store.like_once(first["id"], "voter") == 1
+    assert store.like_once(second["id"], "voter") == 1
+
+    for index in range(10):
+        with pytest.raises(LikeReceiptCapacity):
+            store.like_once(first["id"], f"other-{index}")
+    assert store.like_once(first["id"], "voter") == 1
+    assert store.like_once(second["id"], "voter") == 1
+    assert store.like_once("missing", "other") is None
+
+
+@pytest.mark.parametrize("removal", ["ttl", "items", "bytes", "clear"])
+def test_like_receipt_capacity_is_released_with_image(removal):
+    now = [1000.0]
+    first_data = image_bytes(color="red")
+    second_data = image_bytes(color="blue")
+    store = make_store(
+        clock=lambda: now[0], ttl=60, thumb=0, max_like_receipts=1,
+        max_items=1 if removal == "items" else 2,
+        max_bytes=len(first_data) + len(second_data) - 1 if removal == "bytes" else 1024 * 1024,
+    )
+    first = store.put(first_data, "first.png")
+    assert store.like_once(first["id"], "voter") == 1
+    with pytest.raises(LikeReceiptCapacity):
+        store.like_once(first["id"], "rejected-voter")
+
+    if removal == "ttl":
+        now[0] += 60  # Exact expiry boundary.
+    elif removal == "clear":
+        store.clear()
+    second = store.put(second_data, "second.png")
+
+    assert store.like_once(first["id"], "voter") is None
+    assert store.like_once(second["id"], "rejected-voter") == 1
+    assert store.like_once(second["id"], "rejected-voter") == 1
+
+
+@pytest.mark.parametrize("distinct_voters", [False, True])
+def test_concurrent_votes_are_atomic_and_capacity_is_bounded(distinct_voters):
+    store = make_store(max_like_receipts=4)
+    item = store.put(image_bytes(), "sample.png")
+    barrier = Barrier(8)
+
+    def vote(index):
+        barrier.wait(timeout=5)
+        try:
+            return store.like_once(item["id"], str(index) if distinct_voters else "same-voter")
+        except LikeReceiptCapacity:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(vote, range(8)))
+
+    if distinct_voters:
+        assert results.count(None) == 4
+        assert sorted(result for result in results if result is not None) == [1, 2, 3, 4]
+        assert store.likes(item["id"]) == 4
+        for index, result in enumerate(results):
+            if result is not None:
+                assert store.like_once(item["id"], str(index)) == 4
+    else:
+        assert results == [1] * 8
+        assert store.likes(item["id"]) == 1
 
 
 def test_health_reports_memory_and_freshness(monkeypatch, tmp_path):

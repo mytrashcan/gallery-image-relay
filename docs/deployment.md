@@ -43,7 +43,7 @@ For reverse dynamic SOCKS, use `ssh -N -o ExitOnForwardFailure=yes -o ServerAliv
 - 401 ingest: shared token mismatch; restart web and launcher after changing `.env`.
 - 403 feed/images: Turnstile cookie missing/expired; authenticate in the browser. The terminal dashboard's feed panel cannot solve Turnstile.
 - 413 ingest/image: encoded byte or decoded-pixel bound; inspect configured limits before raising them.
-- 429/503: rate/concurrency limit or maintenance. Clients back off; check edge abuse and worker throughput.
+- 429/503: rate/concurrency limit or maintenance. Clients back off; check edge abuse and worker throughput. A `/like/*` response with `{"error": "likes busy"}` means the store's 5,000 successful-vote receipts are full. Existing voters still receive the current count; new votes resume as images expire or are evicted. Receipts stay in RAM with their images, and requests for missing images do not consume this capacity.
 - Freshness false: no recent gallery activity; inspect per-source logs and destination failures. It is not necessarily a server fault on a quiet board.
 - SQLite locked: inspect competing processes/filesystem and permissions; the archive uses WAL, FULL synchronous commits and a 5-second busy timeout. Do not delete the ledger as a workaround.
 - Corrupt ledger: stop workers, preserve original database/WAL files, restore a verified SQLite backup or investigate on a copy. Automatic replacement would silently forget deduplication state.

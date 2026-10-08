@@ -475,3 +475,20 @@ class TestCompress:
         output, size = handler.compress_image(data, 10, "broken.png")
         assert output.read() == data
         assert size == len(data)
+
+    @pytest.mark.parametrize("filename", ["private-label.png", "private-label\nFORGED-EVENT\r\x1b[31m\u2028.png"])
+    def test_quality_compression_does_not_log_untrusted_filename(self, filename, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="Module.image_handler")
+        noise = Image.frombytes("RGB", (256, 256), random.Random(0).randbytes(256 * 256 * 3))
+        source = io.BytesIO()
+        noise.save(source, format="PNG")
+        data = source.getvalue()
+
+        output, size = ImageHandler().compress_image(data, len(data) // 2, filename)
+
+        assert size <= len(data) // 2
+        assert output.read(2) == b"\xff\xd8"
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("quality:" in message for message in messages)
+        assert all("private-label" not in message and "FORGED-EVENT" not in message for message in messages)
+        assert all(not any(char in message for char in "\r\n\x1b\u2028") for message in messages)
