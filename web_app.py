@@ -360,7 +360,6 @@ def create_app(store: MemoryGalleryStore | None = None) -> FastAPI:
         ("favicon-16x16.png", "image/png"),
         ("favicon-32x32.png", "image/png"),
         ("apple-touch-icon.png", "image/png"),
-        ("og-image.jpg", "image/jpeg"),  # 링크 공유 미리보기(Open Graph)
         ("robots.txt", "text/plain"),    # Sitemap 참조 포함 (CF 관리형 robots와 병합됨)
         ("sitemap.xml", "application/xml"),
         ("manifest.json", "application/manifest+json"),  # PWA
